@@ -16,6 +16,18 @@ public class InvalidStateTransitionException extends RuntimeException {
         this.toStatus = toStatus;
     }
 
+    public InvalidStateTransitionException(final String message) {
+        super(message);
+        this.fromStatus = null;
+        this.toStatus = null;
+    }
+
+    public InvalidStateTransitionException(final PaymentStatus fromStatus, final PaymentStatus toStatus, final String message) {
+        super(message);
+        this.fromStatus = fromStatus;
+        this.toStatus = toStatus;
+    }
+
     public PaymentStatus getFromStatus() {
         return fromStatus;
     }

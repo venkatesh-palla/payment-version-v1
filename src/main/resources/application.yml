@@ -31,6 +31,13 @@ spring:
 
 payment:
   gateway: ${PAYMENT_GATEWAY:fake}
+  gateways:
+    razorpay:
+      base-url: ${PAYMENT_GATEWAY_BASE_URL:https://api.razorpay.com/v1}
+      key-id: ${PAYMENT_GATEWAY_KEY_ID:}
+      key-secret: ${PAYMENT_GATEWAY_KEY_SECRET:}
+      webhook-secret: ${PAYMENT_GATEWAY_WEBHOOK_SECRET:}
+      timeout: ${PAYMENT_GATEWAY_TIMEOUT_MS:5000ms}
   api-key: ${APP_API_KEY:dev-api-key-12345}
   fake-gateway-webhook-secret: ${FAKE_GATEWAY_WEBHOOK_SECRET:fake-webhook-secret-key-12345}
   currency:

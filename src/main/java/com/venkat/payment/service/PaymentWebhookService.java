@@ -152,12 +152,30 @@ public class PaymentWebhookService {
             return "already_paid";
         }
 
-        // 8. Decide new status from VERIFIED gateway response
-        final PaymentStatus verifiedStatus = verified.status() != null ? verified.status() : PaymentStatus.PENDING;
+        // Check if payment was already refunded
+        if (payment.getStatus() == PaymentStatus.REFUNDED) {
+            log.info("Duplicate webhook received for already refunded payment [{}]. Deduped.",
+                    payment.getPaymentReference());
+            this.paymentEventRepository.insertEventIfNotExists(
+                    UUID.randomUUID(),
+                    payment.getId(),
+                    payload.eventId(),
+                    payload.eventType(),
+                    "WEBHOOK",
+                    rawPayloadJson
+            );
+            this.paymentEventRepository.markEventProcessed(payload.eventId());
+            return "already_refunded";
+        }
+
+        // 8. Decide new status from VERIFIED gateway response or refund event
+        final boolean isRefundEvent = payload.eventType() != null && payload.eventType().toLowerCase().contains("refund");
+        final PaymentStatus verifiedStatus = isRefundEvent ? PaymentStatus.REFUNDED
+                : (verified.status() != null ? verified.status() : PaymentStatus.PENDING);
         final PaymentStatus currentStatus = payment.getStatus();
         PaymentStatus targetStatus = verifiedStatus;
         boolean requiresManualReview = false;
-        String reviewReason = null;
+        String reviewReason = isRefundEvent ? "REFUND_WEBHOOK" : null;
         boolean lateSuccess = false;
 
         if (verifiedStatus == PaymentStatus.SUCCESS) {

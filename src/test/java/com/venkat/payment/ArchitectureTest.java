@@ -39,5 +39,10 @@ public class ArchitectureTest {
     public static final ArchRule gatewayImplementationsShouldNotBeTransactional = classes()
             .that().resideInAPackage("..gateway..")
             .should().notBeAnnotatedWith(Transactional.class);
+
+    @ArchTest
+    public static final ArchRule razorpayProviderClassesShouldBeIsolated = noClasses()
+            .that().resideOutsideOfPackage("..gateway.razorpay..")
+            .should().dependOnClassesThat().resideInAPackage("..gateway.razorpay..");
 }
 

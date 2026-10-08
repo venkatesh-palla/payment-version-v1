@@ -5,6 +5,7 @@ import com.venkat.payment.domain.Payment;
 import com.venkat.payment.domain.PaymentStatus;
 import com.venkat.payment.repository.PaymentOutboxRepository;
 import com.venkat.payment.repository.PaymentRepository;
+import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.HashSet;
@@ -100,6 +101,7 @@ public class PaymentStatusUpdateService {
             case SUCCESS -> "PAYMENT_SUCCESS";
             case FAILED -> "PAYMENT_FAILED";
             case EXPIRED -> "PAYMENT_EXPIRED";
+            case CANCELLED -> "PAYMENT_CANCELLED";
             case REFUNDED -> "PAYMENT_REFUNDED";
             default -> null;
         };
@@ -107,6 +109,9 @@ public class PaymentStatusUpdateService {
         if (eventType != null) {
             final String eventId = payment.getId() + ":" + eventType;
             final Instant now = this.clock.instant();
+            final String refundId = (targetStatus == PaymentStatus.REFUNDED) ? gatewayPaymentId : null;
+            final BigDecimal refundedAmount = (targetStatus == PaymentStatus.REFUNDED) ? payment.getAmount() : null;
+
             final OutboxEventPayload eventPayload = new OutboxEventPayload(
                     eventId,
                     eventType,
@@ -122,7 +127,9 @@ public class PaymentStatusUpdateService {
                     paidAt != null ? paidAt : payment.getPaidAt(),
                     lateSuccess,
                     targetStatus == PaymentStatus.FAILED ? reviewReason : null,
-                    targetStatus == PaymentStatus.EXPIRED ? now : null
+                    targetStatus == PaymentStatus.EXPIRED ? now : null,
+                    refundId,
+                    refundedAmount
             );
 
             try {

@@ -46,11 +46,13 @@ public class PaymentService {
     private static final String ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
     private static final String IDEMPOTENCY_SCOPE_PAYMENTS = "PAYMENT_CREATE";
+    private static final String IDEMPOTENCY_SCOPE_REFUNDS = "PAYMENT_REFUND";
 
     private final PaymentRepository paymentRepository;
     private final IdempotencyKeyRepository idempotencyRepository;
     private final PaymentGatewayRegistry gatewayRegistry;
     private final PaymentStateMachine stateMachine;
+    private final PaymentStatusUpdateService statusUpdateService;
     private final PaymentProperties paymentProperties;
     private final ObjectMapper objectMapper;
     private final Clock clock;
@@ -59,6 +61,7 @@ public class PaymentService {
                           final IdempotencyKeyRepository idempotencyRepository,
                           final PaymentGatewayRegistry gatewayRegistry,
                           final PaymentStateMachine stateMachine,
+                          final PaymentStatusUpdateService statusUpdateService,
                           final PaymentProperties paymentProperties,
                           final ObjectMapper objectMapper,
                           final Clock clock) {
@@ -66,6 +69,7 @@ public class PaymentService {
         this.idempotencyRepository = idempotencyRepository;
         this.gatewayRegistry = gatewayRegistry;
         this.stateMachine = stateMachine;
+        this.statusUpdateService = statusUpdateService;
         this.paymentProperties = paymentProperties;
         this.objectMapper = objectMapper;
         this.clock = clock;
@@ -177,6 +181,226 @@ public class PaymentService {
         final Payment payment = this.paymentRepository.findById(paymentId)
                 .orElseThrow(() -> new PaymentNotFoundException(paymentId));
 
+        return mapToResponse(payment);
+    }
+
+    /**
+     * Cancels an existing unpaid payment session.
+     * Verifies with gateway outside transaction first; if already paid, transitions to SUCCESS instead.
+     */
+    public PaymentResponse cancelPayment(final UUID paymentId, final String userCustomerId, final boolean isInternalUser) {
+        final Payment payment = this.paymentRepository.findById(paymentId)
+                .orElseThrow(() -> new PaymentNotFoundException(paymentId));
+
+        if (!isInternalUser && (userCustomerId == null || !userCustomerId.equals(payment.getCustomerId()))) {
+            // Prevent customer enumeration
+            log.warn("Customer [{}] attempted to cancel payment [{}] owned by [{}]",
+                    userCustomerId, paymentId, payment.getCustomerId());
+            throw new PaymentNotFoundException(paymentId);
+        }
+
+        if (payment.getStatus() == PaymentStatus.CANCELLED) {
+            log.info("Payment [{}] already cancelled; returning existing state", payment.getPaymentReference());
+            return mapToResponse(payment);
+        }
+
+        if (payment.getStatus() != PaymentStatus.CREATED
+                && payment.getStatus() != PaymentStatus.QR_GENERATED
+                && payment.getStatus() != PaymentStatus.PENDING) {
+            throw new InvalidStateTransitionException("Cannot cancel payment in status: " + payment.getStatus());
+        }
+
+        // Call gateway outside transaction to ensure customer hasn't paid in the background
+        final PaymentGateway gateway = this.gatewayRegistry.getGateway(payment.getGateway());
+        if (payment.getGatewayOrderId() != null) {
+            final com.venkat.payment.gateway.model.PaymentVerificationResponse verified =
+                    gateway.verifyPayment(payment.getGatewayOrderId());
+
+            if (verified.status() == PaymentStatus.SUCCESS) {
+                log.warn("Payment [{}] was already paid at gateway! Cannot cancel; transitioning to SUCCESS",
+                        payment.getPaymentReference());
+                this.statusUpdateService.transitionStatusWithOutbox(
+                        payment,
+                        PaymentStatus.SUCCESS,
+                        verified.paidAt(),
+                        verified.gatewayPaymentId(),
+                        false,
+                        null,
+                        false
+                );
+                throw new InvalidStateTransitionException("Payment has already been completed and cannot be cancelled");
+            }
+
+            // Explicitly close provider-side dynamic QR so it cannot be scanned
+            gateway.closePayment(payment.getGatewayOrderId());
+        }
+
+        // Transition status to CANCELLED and emit PAYMENT_CANCELLED outbox event
+        this.statusUpdateService.transitionStatusWithOutbox(
+                payment,
+                PaymentStatus.CANCELLED,
+                null,
+                null,
+                false,
+                "CANCELLED_BY_CLIENT",
+                false
+        );
+
+        final Payment updated = this.paymentRepository.findById(paymentId).orElse(payment);
+        return mapToResponse(updated);
+    }
+
+    /**
+     * Processes an idempotent refund against an authoritative SUCCESS payment.
+     */
+    public com.venkat.payment.api.RefundPaymentResponse refundPayment(
+            final UUID paymentId,
+            final String idempotencyKey,
+            final com.venkat.payment.api.RefundPaymentRequest request) {
+
+        final String requestHash = computeRefundRequestHash(paymentId, request);
+        final Instant now = this.clock.instant();
+        final Instant keyExpiry = now.plus(this.paymentProperties.getIdempotency().getTtl());
+
+        // 1. Claim idempotency key atomically
+        final boolean claimed = this.idempotencyRepository.tryClaimKey(
+                IDEMPOTENCY_SCOPE_REFUNDS,
+                idempotencyKey,
+                requestHash,
+                keyExpiry
+        );
+
+        if (!claimed) {
+            final IdempotencyKeyRepository.IdempotencyRecord existing = this.idempotencyRepository.findByKey(
+                    IDEMPOTENCY_SCOPE_REFUNDS,
+                    idempotencyKey
+            ).orElseThrow(() -> new RequestInProgressException("Refund request currently processing", 2));
+
+            if (!existing.requestHash().equalsIgnoreCase(requestHash)) {
+                log.warn("Idempotency key [{}] reused with different refund payload", idempotencyKey);
+                throw new IdempotencyKeyReusedException("Idempotency key has already been used with different parameters");
+            }
+
+            if ("IN_PROGRESS".equalsIgnoreCase(existing.status())) {
+                throw new RequestInProgressException("A refund with this idempotency key is currently processing", 2);
+            }
+
+            if ("COMPLETED".equalsIgnoreCase(existing.status()) && existing.responseBody() != null) {
+                try {
+                    return this.objectMapper.readValue(existing.responseBody(), com.venkat.payment.api.RefundPaymentResponse.class);
+                } catch (final Exception e) {
+                    log.error("Failed to deserialize cached refund response", e);
+                }
+            }
+        }
+
+        // 2. Fetch payment and validate status
+        final Payment payment = this.paymentRepository.findById(paymentId)
+                .orElseThrow(() -> new PaymentNotFoundException(paymentId));
+
+        if (payment.getStatus() == PaymentStatus.REFUNDED) {
+            log.info("Payment [{}] already in REFUNDED status", payment.getPaymentReference());
+            return new com.venkat.payment.api.RefundPaymentResponse(
+                    payment.getId(),
+                    PaymentStatus.REFUNDED,
+                    payment.getGatewayPaymentId(),
+                    payment.getAmount(),
+                    payment.getCurrency(),
+                    payment.getUpdatedAt()
+            );
+        }
+
+        if (payment.getStatus() != PaymentStatus.SUCCESS) {
+            throw new InvalidStateTransitionException("Cannot refund payment in status: " + payment.getStatus() + "; payment must be in SUCCESS status");
+        }
+
+        // Full refund check (partial refunds documented as future extension)
+        final BigDecimal refundAmount = (request != null && request.amount() != null)
+                ? request.amount()
+                : payment.getAmount();
+
+        if (refundAmount.compareTo(payment.getAmount()) != 0) {
+            throw new InvalidInputException("Partial refunds are not currently supported; expected full amount of " + payment.getAmount());
+        }
+
+        // 3. Call provider refund API outside DB transaction
+        final PaymentGateway gateway = this.gatewayRegistry.getGateway(payment.getGateway());
+        final com.venkat.payment.gateway.model.RefundRequest gatewayRequest = new com.venkat.payment.gateway.model.RefundRequest(
+                payment.getGatewayPaymentId(),
+                refundAmount,
+                payment.getCurrency(),
+                payment.getPaymentReference(),
+                request != null && request.reason() != null ? request.reason() : "Customer requested refund"
+        );
+
+        final com.venkat.payment.gateway.model.RefundResponse gatewayResponse;
+        try {
+            gatewayResponse = gateway.refund(gatewayRequest);
+        } catch (final Exception ex) {
+            log.error("Refund gateway call failed for payment [{}]", payment.getPaymentReference(), ex);
+            throw new PaymentGatewayUnavailableException("Gateway failed to process refund: " + ex.getMessage(), ex);
+        }
+
+        // 4. Update status with outbox and complete idempotency key
+        final com.venkat.payment.api.RefundPaymentResponse response = new com.venkat.payment.api.RefundPaymentResponse(
+                payment.getId(),
+                PaymentStatus.REFUNDED,
+                gatewayResponse.refundId(),
+                gatewayResponse.amount(),
+                gatewayResponse.currency(),
+                gatewayResponse.refundedAt() != null ? gatewayResponse.refundedAt() : now
+        );
+
+        finalizeRefundAndCompleteIdempotency(payment, gatewayResponse.refundId(), idempotencyKey, response);
+
+        return response;
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void finalizeRefundAndCompleteIdempotency(final Payment payment,
+                                                    final String refundId,
+                                                    final String idempotencyKey,
+                                                    final com.venkat.payment.api.RefundPaymentResponse response) {
+        this.statusUpdateService.transitionStatusWithOutbox(
+                payment,
+                PaymentStatus.REFUNDED,
+                null,
+                refundId,
+                false,
+                "REFUND: " + refundId,
+                false
+        );
+
+        try {
+            final String responseJson = this.objectMapper.writeValueAsString(response);
+            this.idempotencyRepository.completeKey(
+                    IDEMPOTENCY_SCOPE_REFUNDS,
+                    idempotencyKey,
+                    200,
+                    responseJson,
+                    payment.getId()
+            );
+        } catch (final Exception e) {
+            log.error("Failed to cache refund response in idempotency record", e);
+        }
+    }
+
+    public static String computeRefundRequestHash(final UUID paymentId, final com.venkat.payment.api.RefundPaymentRequest request) {
+        final String canonicalString = String.format("REFUND:%s:%s:%s",
+                paymentId,
+                request != null && request.amount() != null ? request.amount().setScale(2).toPlainString() : "FULL",
+                request != null && request.reason() != null ? request.reason().trim() : ""
+        );
+        try {
+            final MessageDigest md = MessageDigest.getInstance("SHA-256");
+            final byte[] hash = md.digest(canonicalString.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(hash);
+        } catch (final NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 not available", e);
+        }
+    }
+
+    private PaymentResponse mapToResponse(final Payment payment) {
         return new PaymentResponse(
                 payment.getId(),
                 payment.getPaymentReference(),

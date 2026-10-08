@@ -52,6 +52,9 @@ class PaymentConcurrencyTest {
     @Mock
     private PaymentGateway paymentGateway;
 
+    @Mock
+    private PaymentStatusUpdateService statusUpdateService;
+
     private PaymentProperties paymentProperties;
     private ObjectMapper objectMapper;
     private Clock fixedClock;
@@ -99,6 +102,7 @@ class PaymentConcurrencyTest {
                 inMemoryIdempotencyRepo,
                 this.gatewayRegistry,
                 new PaymentStateMachine(),
+                this.statusUpdateService,
                 this.paymentProperties,
                 this.objectMapper,
                 this.fixedClock

@@ -79,4 +79,47 @@ public class PaymentController {
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
                 .body(response);
     }
+
+    @PostMapping("/{paymentId}/cancel")
+    public ResponseEntity<PaymentResponse> cancelPayment(
+            @PathVariable("paymentId") final UUID paymentId,
+            @AuthenticationPrincipal final Jwt jwt) {
+
+        String callerSubject = null;
+        boolean isInternal = false;
+
+        if (jwt != null) {
+            final String scope = jwt.getClaimAsString("scope");
+            isInternal = scope != null && scope.contains("payments:internal");
+            callerSubject = jwt.getSubject();
+        }
+
+        final PaymentResponse response = this.paymentService.cancelPayment(paymentId, callerSubject, isInternal);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{paymentId}/refund")
+    public ResponseEntity<RefundPaymentResponse> refundPayment(
+            @PathVariable("paymentId") final UUID paymentId,
+            @RequestHeader(value = "Idempotency-Key", required = false) final String idempotencyKey,
+            @Valid @RequestBody(required = false) final RefundPaymentRequest request,
+            @AuthenticationPrincipal final Jwt jwt) {
+
+        if (jwt != null) {
+            final String scope = jwt.getClaimAsString("scope");
+            final boolean isInternal = scope != null && scope.contains("payments:internal");
+            if (!isInternal) {
+                throw new org.springframework.security.access.AccessDeniedException(
+                        "Scope payments:internal is required to issue refunds"
+                );
+            }
+        }
+
+        if (idempotencyKey == null || idempotencyKey.trim().length() < 8 || idempotencyKey.trim().length() > 128) {
+            throw new MissingIdempotencyKeyException("Idempotency-Key header is required for refunds");
+        }
+
+        final RefundPaymentResponse response = this.paymentService.refundPayment(paymentId, idempotencyKey.trim(), request);
+        return ResponseEntity.ok(response);
+    }
 }

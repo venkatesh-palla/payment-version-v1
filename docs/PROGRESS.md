@@ -80,3 +80,37 @@ Tracking progress for **Level 1 (INITIAL)** and **Level 2 (MEDIUM): Make It Reli
 - [x] JWT scopes and ownership work; webhook works without JWT.
 - [x] Logs show correlation IDs and contain no secrets.
 - [x] `docs/PROGRESS.md` updated; README updated with idempotency, outbox, schedulers, and JWT auth.
+
+---
+
+## Level 3 Roadmap & Status (In Progress)
+
+- [x] **Step 3.1: Real Gateway Adapter (Razorpay Isolated)**
+  - Extended `PaymentGateway` interface with `default void closePayment(String gatewayOrderId)` and `default RefundResponse refund(RefundRequest request)`.
+  - Created isolated `com.venkat.payment.gateway.razorpay` package:
+    - `RazorpayProperties`, `RazorpayClient` (Spring `RestClient`, Basic Auth, Resilience4j circuit breaker + retry, sanitized error logging).
+    - DTOs: `RazorpayCreateQrRequest`, `RazorpayQrResponse`, `RazorpayPaymentListResponse`, `RazorpayPaymentItem`, `RazorpayRefundRequest`, `RazorpayRefundResponse`.
+    - `RazorpayStatusMapper` (safe status mapping; unrecognized statuses map to `PENDING` with warning, never `SUCCESS`).
+    - `RazorpaySignatureVerifier` (HMAC-SHA256 constant-time verification + configurable timestamp replay tolerance).
+    - `RazorpayGateway` implementing `PaymentGateway` with paise conversion and dynamic single-use QR generation.
+  - Documented `gateway/razorpay/INTEGRATION_POINTS.md`.
+  - Added ArchUnit isolation test enforcing that classes outside `gateway.razorpay` cannot import Razorpay classes.
+  - Unit tests with `MockRestServiceServer` verifying QR creation, status polling, QR closing, refund processing, and signature verification.
+- [x] **Step 3.2: Cancel and Refund (Full Production Flow)**
+  - `POST /api/v1/payments/{paymentId}/cancel`:
+    - Checks gateway status first outside DB transaction. If customer paid (`status == SUCCESS`), transitions to `SUCCESS` and throws 409 `InvalidStateTransitionException`.
+    - If unpaid, closes gateway QR and transitions payment to `CANCELLED`, publishing `PAYMENT_CANCELLED` transactional outbox event.
+    - Authorized for scopes `payments:cancel`, `payments:write`, or `payments:internal`.
+  - `POST /api/v1/payments/{paymentId}/refund`:
+    - Requires `payments:internal` scope and mandatory `Idempotency-Key` header under `PAYMENT_REFUND` scope.
+    - Full refund support (`refundAmount == payment.amount`); validates payment is in `SUCCESS` status.
+    - Calls `gateway.refund()` outside DB transaction, updates payment status to `REFUNDED`, records `refund_id`, and publishes `PAYMENT_REFUNDED` outbox event atomically.
+  - Webhook refund handling (`payment.refunded` / `refund.processed`) with deduplication against double-processing.
+  - Integration tests in `PaymentServiceTest` and `PaymentControllerTest` covering all cancel/refund scenarios and error cases.
+- [ ] **Step 3.3: Stuck-Payment Recovery, Reconciliation, and Cleanup Jobs**
+- [ ] **Step 3.4: Security Hardening & Startup Profile Guards**
+- [ ] **Step 3.5: Metrics, Alerts & Production Runbook**
+- [ ] **Step 3.6: Real UPI App Test Kit & Sandbox Setup**
+- [ ] **Step 3.7: Final End-to-End Suite & Code Coverage Verification**
+- [ ] **Step 3.8: Production Documentation & Mermaid Diagrams**
+

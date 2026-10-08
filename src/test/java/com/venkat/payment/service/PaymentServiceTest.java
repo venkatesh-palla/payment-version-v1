@@ -53,6 +53,9 @@ class PaymentServiceTest {
     @Mock
     private PaymentGateway paymentGateway;
 
+    @Mock
+    private PaymentStatusUpdateService statusUpdateService;
+
     private PaymentStateMachine stateMachine;
     private PaymentProperties paymentProperties;
     private ObjectMapper objectMapper;
@@ -72,6 +75,7 @@ class PaymentServiceTest {
                 this.idempotencyRepository,
                 this.gatewayRegistry,
                 this.stateMachine,
+                this.statusUpdateService,
                 this.paymentProperties,
                 this.objectMapper,
                 this.fixedClock
@@ -194,5 +198,99 @@ class PaymentServiceTest {
         assertThatThrownBy(() -> this.paymentService.getPayment(id))
                 .isInstanceOf(PaymentNotFoundException.class)
                 .hasMessageContaining(id.toString());
+    }
+
+    @Test
+    @DisplayName("Cancel payment when unpaid closes provider QR and transitions to CANCELLED")
+    void cancelPaymentSuccess() {
+        final UUID id = UUID.randomUUID();
+        final Payment payment = new Payment(
+                id, "PAY-REF-CANCEL", "ORD-1", "CUST-1", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_cancel", null, PaymentStatus.PENDING, "UPI", "upi://...",
+                Instant.now().plusSeconds(600), null, false, null, 0, null, 1L, Instant.now(), Instant.now()
+        );
+        when(this.paymentRepository.findById(id)).thenReturn(Optional.of(payment));
+        when(this.gatewayRegistry.getGateway("fake")).thenReturn(this.paymentGateway);
+        when(this.paymentGateway.verifyPayment("fake_ord_cancel"))
+                .thenReturn(new com.venkat.payment.gateway.model.PaymentVerificationResponse(
+                        "fake_ord_cancel", null, PaymentStatus.PENDING, new BigDecimal("500.00"), "INR", "UPI", null));
+
+        final PaymentResponse response = this.paymentService.cancelPayment(id, "CUST-1", false);
+
+        verify(this.paymentGateway).closePayment("fake_ord_cancel");
+        verify(this.statusUpdateService).transitionStatusWithOutbox(
+                eq(payment), eq(PaymentStatus.CANCELLED), eq(null), eq(null), eq(false), eq("CANCELLED_BY_CLIENT"), eq(false));
+    }
+
+    @Test
+    @DisplayName("Cancel payment when already paid at gateway transitions to SUCCESS and rejects cancellation")
+    void cancelPaymentWhenPaidAtGatewayTransitionsToSuccessAndThrows() {
+        final UUID id = UUID.randomUUID();
+        final Payment payment = new Payment(
+                id, "PAY-REF-PAID", "ORD-1", "CUST-1", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_paid", null, PaymentStatus.PENDING, "UPI", "upi://...",
+                Instant.now().plusSeconds(600), null, false, null, 0, null, 1L, Instant.now(), Instant.now()
+        );
+        final Instant paidAt = Instant.now().minusSeconds(10);
+        when(this.paymentRepository.findById(id)).thenReturn(Optional.of(payment));
+        when(this.gatewayRegistry.getGateway("fake")).thenReturn(this.paymentGateway);
+        when(this.paymentGateway.verifyPayment("fake_ord_paid"))
+                .thenReturn(new com.venkat.payment.gateway.model.PaymentVerificationResponse(
+                        "fake_ord_paid", "fake_pay_1", PaymentStatus.SUCCESS, new BigDecimal("500.00"), "INR", "UPI", paidAt));
+
+        assertThatThrownBy(() -> this.paymentService.cancelPayment(id, "CUST-1", false))
+                .isInstanceOf(InvalidStateTransitionException.class)
+                .hasMessageContaining("Payment has already been completed and cannot be cancelled");
+
+        verify(this.statusUpdateService).transitionStatusWithOutbox(
+                eq(payment), eq(PaymentStatus.SUCCESS), eq(paidAt), eq("fake_pay_1"), eq(false), eq(null), eq(false));
+    }
+
+    @Test
+    @DisplayName("Refund payment success calls gateway and records outbox event")
+    void refundPaymentSuccess() {
+        final UUID id = UUID.randomUUID();
+        final Payment payment = new Payment(
+                id, "PAY-REF-RFND", "ORD-1", "CUST-1", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_1", "fake_pay_1", PaymentStatus.SUCCESS, "UPI", "upi://...",
+                Instant.now().plusSeconds(600), Instant.now(), false, null, 0, null, 1L, Instant.now(), Instant.now()
+        );
+        final String idempotencyKey = "REFUND-KEY-12345678";
+        final com.venkat.payment.api.RefundPaymentRequest request =
+                new com.venkat.payment.api.RefundPaymentRequest(new BigDecimal("500.00"), "Customer return");
+
+        when(this.idempotencyRepository.tryClaimKey(any(), eq(idempotencyKey), any(), any())).thenReturn(true);
+        when(this.paymentRepository.findById(id)).thenReturn(Optional.of(payment));
+        when(this.gatewayRegistry.getGateway("fake")).thenReturn(this.paymentGateway);
+        when(this.paymentGateway.refund(any())).thenReturn(
+                new com.venkat.payment.gateway.model.RefundResponse("rfnd_1", "fake_pay_1", new BigDecimal("500.00"), "INR", "processed", Instant.now())
+        );
+
+        final com.venkat.payment.api.RefundPaymentResponse response =
+                this.paymentService.refundPayment(id, idempotencyKey, request);
+
+        assertThat(response.status()).isEqualTo(PaymentStatus.REFUNDED);
+        assertThat(response.refundId()).isEqualTo("rfnd_1");
+        assertThat(response.refundedAmount()).isEqualTo(new BigDecimal("500.00"));
+        verify(this.statusUpdateService).transitionStatusWithOutbox(
+                eq(payment), eq(PaymentStatus.REFUNDED), eq(null), eq("rfnd_1"), eq(false), eq("REFUND: rfnd_1"), eq(false));
+    }
+
+    @Test
+    @DisplayName("Refund payment when not in SUCCESS throws InvalidStateTransitionException")
+    void refundPaymentWhenNotSuccessThrows() {
+        final UUID id = UUID.randomUUID();
+        final Payment payment = new Payment(
+                id, "PAY-REF-PENDING", "ORD-1", "CUST-1", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_1", null, PaymentStatus.PENDING, "UPI", "upi://...",
+                Instant.now().plusSeconds(600), null, false, null, 0, null, 1L, Instant.now(), Instant.now()
+        );
+        final String idempotencyKey = "REFUND-KEY-PENDING";
+        when(this.idempotencyRepository.tryClaimKey(any(), eq(idempotencyKey), any(), any())).thenReturn(true);
+        when(this.paymentRepository.findById(id)).thenReturn(Optional.of(payment));
+
+        assertThatThrownBy(() -> this.paymentService.refundPayment(id, idempotencyKey, null))
+                .isInstanceOf(InvalidStateTransitionException.class)
+                .hasMessageContaining("Cannot refund payment in status: PENDING");
     }
 }

@@ -166,4 +166,62 @@ class PaymentControllerTest {
                 .andExpect(jsonPath("$.paymentId").value(paymentId.toString()))
                 .andExpect(jsonPath("$.status").value("SUCCESS"));
     }
+
+    @Test
+    @DisplayName("POST /api/v1/payments/{id}/cancel cancels payment when caller has payments:cancel scope")
+    void cancelPaymentSuccess() throws Exception {
+        final UUID paymentId = UUID.randomUUID();
+        final PaymentResponse cancelledResponse = new PaymentResponse(
+                paymentId, "PAY-ABC123456789", "ORD-1", PaymentStatus.CANCELLED,
+                new BigDecimal("500.00"), "INR", null, Instant.now()
+        );
+
+        when(this.paymentService.cancelPayment(eq(paymentId), any(), any(Boolean.class)))
+                .thenReturn(cancelledResponse);
+
+        this.mockMvc.perform(post("/api/v1/payments/" + paymentId + "/cancel")
+                        .with(jwt().jwt(j -> j.subject("client-app").claim("scope", "payments:cancel"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.paymentId").value(paymentId.toString()))
+                .andExpect(jsonPath("$.status").value("CANCELLED"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/payments/{id}/refund refunds payment when caller has payments:internal and valid Idempotency-Key")
+    void refundPaymentSuccess() throws Exception {
+        final UUID paymentId = UUID.randomUUID();
+        final RefundPaymentResponse refundResponse = new RefundPaymentResponse(
+                paymentId, PaymentStatus.REFUNDED, "rfnd_test123",
+                new BigDecimal("500.00"), "INR", Instant.now()
+        );
+
+        when(this.paymentService.refundPayment(eq(paymentId), eq("REFUND-IDEMP-KEY-12345678"), any(RefundPaymentRequest.class)))
+                .thenReturn(refundResponse);
+
+        final RefundPaymentRequest body = new RefundPaymentRequest(new BigDecimal("500.00"), "Customer requested refund");
+
+        this.mockMvc.perform(post("/api/v1/payments/" + paymentId + "/refund")
+                        .header("Idempotency-Key", "REFUND-IDEMP-KEY-12345678")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(this.objectMapper.writeValueAsString(body))
+                        .with(jwt().jwt(j -> j.subject("support-agent").claim("scope", "payments:internal"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.paymentId").value(paymentId.toString()))
+                .andExpect(jsonPath("$.refundId").value("rfnd_test123"))
+                .andExpect(jsonPath("$.status").value("REFUNDED"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/payments/{id}/refund without Idempotency-Key fails with 400 MISSING_IDEMPOTENCY_KEY")
+    void refundPaymentMissingIdempotencyKey() throws Exception {
+        final UUID paymentId = UUID.randomUUID();
+        final RefundPaymentRequest body = new RefundPaymentRequest(new BigDecimal("500.00"), "Customer requested refund");
+
+        this.mockMvc.perform(post("/api/v1/payments/" + paymentId + "/refund")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(this.objectMapper.writeValueAsString(body))
+                        .with(jwt().jwt(j -> j.subject("support-agent").claim("scope", "payments:internal"))))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("MISSING_IDEMPOTENCY_KEY"));
+    }
 }

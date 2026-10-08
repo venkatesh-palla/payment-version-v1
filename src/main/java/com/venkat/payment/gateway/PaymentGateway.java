@@ -40,5 +40,25 @@ public interface PaymentGateway {
      * @return true if valid, false otherwise
      */
     boolean verifyWebhookSignature(byte[] rawBody, String signature);
+
+    /**
+     * Closes an active single-use QR code or payment session at the provider upon cancellation or expiration.
+     * Optional operation; default is a no-op if unsupported by provider.
+     *
+     * @param gatewayOrderId provider order/session/QR identifier
+     */
+    default void closePayment(String gatewayOrderId) {
+        // Default no-op for providers that do not support explicit QR closure
+    }
+
+    /**
+     * Initiates a refund for a previously captured payment.
+     *
+     * @param request refund details
+     * @return refund response
+     */
+    default com.venkat.payment.gateway.model.RefundResponse refund(com.venkat.payment.gateway.model.RefundRequest request) {
+        throw new UnsupportedOperationException("Refund is not supported by " + gatewayName());
+    }
 }
 
