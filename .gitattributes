@@ -1,0 +1,26 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Scripts must have LF line endings
+*.sh text eol=lf
+bin/* text eol=lf
+mvnw text eol=lf
+
+# Windows scripts must have CRLF line endings
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Java source code
+*.java text diff=java eol=lf
+*.xml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
+*.md text eol=lf
+
+# Binary files
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary

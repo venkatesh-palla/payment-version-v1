@@ -1,0 +1,72 @@
+name: Dev Build & Deploy
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:
+
+concurrency:
+  group: dev-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Verify (Matrix)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: ['21']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Verify & Checkstyle Check
+        run: |
+          mvn -B clean verify checkstyle:check
+
+  deploy-dev:
+    name: Deploy to Development
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Package JAR Artifacts
+        run: |
+          mvn -B clean package -DskipTests
+
+      - name: Run Database Migration (Release Phase)
+        env:
+          SPRING_DATASOURCE_URL: ${{ secrets.DEV_DATABASE_URL }}
+          SPRING_DATASOURCE_USERNAME: ${{ secrets.DEV_DATABASE_USERNAME }}
+          SPRING_DATASOURCE_PASSWORD: ${{ secrets.DEV_DATABASE_PASSWORD }}
+          SPRING_FLYWAY_ENABLED: 'true'
+        run: |
+          ./bin/release-phase
+
+      - name: Build Docker Image
+        run: |
+          docker build -t venkat-api-service:dev-${{ github.sha }} .
+
+      - name: Publish & Deploy Dev Container
+        env:
+          REGISTRY_AUTH_TOKEN: ${{ secrets.DEV_REGISTRY_TOKEN }}
+        run: |
+          echo "Deploying image venkat-api-service:dev-${{ github.sha }} to dev environment"

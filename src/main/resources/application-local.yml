@@ -1,0 +1,23 @@
+server:
+  port: 8080
+
+management:
+  server:
+    port: 8081
+
+spring:
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/payment_db}
+    username: ${DATABASE_USERNAME:payment_user}
+    password: ${DATABASE_PASSWORD:payment_secret}
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          secret: ${DEV_JWT_SECRET:local-dev-jwt-secret-key-must-be-at-least-32-bytes-long!}
+
+payment:
+  gateway: fake
+  dev:
+    enabled: true
+

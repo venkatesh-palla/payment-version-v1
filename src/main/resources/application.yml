@@ -1,0 +1,95 @@
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+
+management:
+  server:
+    port: ${MANAGEMENT_PORT:8081}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+
+spring:
+  application:
+    name: payment-service
+
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/payment_db}
+    username: ${DATABASE_USERNAME:postgres}
+    password: ${DATABASE_PASSWORD:venkat}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: PaymentHikariCP
+      maximum-pool-size: ${HIKARI_MAX_POOL_SIZE:20}
+      minimum-idle: ${HIKARI_MIN_IDLE:5}
+
+  flyway:
+    enabled: ${FLYWAY_ENABLED:true}
+    baseline-on-migrate: true
+
+payment:
+  gateway: ${PAYMENT_GATEWAY:fake}
+  currency:
+    default: INR
+    allowed:
+      - INR
+  max-amount: 100000.00
+  allow-multiple-active-per-order: false
+  qr:
+    expiry: PT15M
+  webhook:
+    enabled: true
+    allowed-ips: []
+    max-body-bytes: 262144
+    timestamp-tolerance: PT5M
+  verification:
+    enabled: true
+    interval: PT30S
+    min-age: PT1M
+    max-attempts: 10
+    max-period: PT30M
+    batch-size: 50
+    backoff:
+      - PT30S
+      - PT1M
+      - PT2M
+      - PT5M
+      - PT10M
+  expiry:
+    interval: PT60S
+    grace: PT60S
+    batch-size: 50
+  recovery:
+    interval: PT5M
+    stuck-threshold: PT5M
+  outbox:
+    poll-interval: PT2S
+    batch-size: 50
+    lease: PT30S
+    retry:
+      interval: PT10S
+      backoff-multiplier: 2.0
+      max-interval: PT10M
+    max-retries: 10
+    retention: P7D
+  events:
+    delivery-mode: IN_PROCESS # or HTTP_CALLBACK
+    callback-url: ${PAYMENT_EVENTS_CALLBACK_URL:}
+    callback-secret: ${PAYMENT_EVENTS_CALLBACK_SECRET:}
+    callback-timeout: PT5S
+  business-process:
+    poll-interval: PT5S
+    max-retries: 5
+    backoff-multiplier: 2.0
+  idempotency:
+    ttl: PT72H
+  reconciliation:
+    enabled: false
+    cron: "0 30 2 * * *"
+  dev:
+    enabled: false
+

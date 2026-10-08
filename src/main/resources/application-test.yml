@@ -1,0 +1,25 @@
+server:
+  port: 0
+
+management:
+  server:
+    port: 0
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/payment_test_db
+    username: payment_user
+    password: payment_secret
+  flyway:
+    enabled: false
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          secret: test-jwt-secret-key-must-be-at-least-32-bytes-long!
+
+payment:
+  gateway: fake
+  dev:
+    enabled: true
+

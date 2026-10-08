@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <!-- Local / Test Console Pattern -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [corr=%X{correlationId:-none}] [pay=%X{paymentId:-none}] - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- JSON Structured Appender for Prod and Default -->
+    <appender name="JSON_CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <providers>
+                <timestamp>
+                    <timeZone>UTC</timeZone>
+                </timestamp>
+                <version/>
+                <logLevel/>
+                <threadName/>
+                <loggerName/>
+                <message/>
+                <mdc/>
+                <stackTrace/>
+            </providers>
+        </encoder>
+    </appender>
+
+    <!-- Profile-specific root appenders -->
+    <springProfile name="local,test">
+        <root level="INFO">
+            <appender-ref ref="CONSOLE"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="!local &amp; !test">
+        <root level="INFO">
+            <appender-ref ref="JSON_CONSOLE"/>
+        </root>
+    </springProfile>
+</configuration>
+
