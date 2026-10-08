@@ -1,17 +1,19 @@
 .PHONY: db-up db-down run test verify
 
 db-up:
-	@./scripts/db-up.sh
+	docker compose up -d postgres
+	@echo "Waiting for PostgreSQL to be healthy..."
+	@until docker compose exec -T postgres pg_isready -U payment_user -d payment_db >/dev/null 2>&1; do sleep 1; done
+	@echo "PostgreSQL is ready on port 5432!"
 
 db-down:
-	@./scripts/db-down.sh
+	docker compose down
 
 run:
-	@./scripts/run.sh
+	./mvnw spring-boot:run -Dspring-boot.run.profiles=local
 
 test:
-	@./scripts/test.sh
+	./mvnw test
 
 verify:
-	@./scripts/verify.sh
-
+	./mvnw clean verify
