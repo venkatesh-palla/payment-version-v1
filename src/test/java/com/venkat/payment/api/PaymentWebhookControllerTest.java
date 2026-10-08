@@ -1,6 +1,8 @@
 package com.venkat.payment.api;
 
 import com.venkat.payment.config.ClockConfig;
+import com.venkat.payment.config.PaymentProperties;
+import com.venkat.payment.security.SecurityConfig;
 import com.venkat.payment.service.PaymentWebhookService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -19,7 +21,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(PaymentWebhookController.class)
-@Import({GlobalExceptionHandler.class, ClockConfig.class})
+@Import({GlobalExceptionHandler.class, ClockConfig.class, PaymentProperties.class, SecurityConfig.class})
 class PaymentWebhookControllerTest {
 
     @Autowired
@@ -27,6 +29,21 @@ class PaymentWebhookControllerTest {
 
     @MockitoBean
     private PaymentWebhookService webhookService;
+
+    @Test
+    @DisplayName("Webhook without JWT succeeds if signature valid (permitAll)")
+    void webhookWorksWithoutJwt() throws Exception {
+        when(this.webhookService.processWebhook(eq("fake"), any(), eq("valid_sig")))
+                .thenReturn("processed");
+
+        this.mockMvc.perform(post("/api/v1/payments/webhook/fake")
+                        .header("X-Signature", "valid_sig")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"eventId\":\"evt_1\",\"gatewayOrderId\":\"ord_1\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("ok"))
+                .andExpect(jsonPath("$.result").value("processed"));
+    }
 
     @Test
     @DisplayName("Webhook missing X-Signature header returns 401 UNAUTHORIZED")
@@ -39,7 +56,7 @@ class PaymentWebhookControllerTest {
     }
 
     @Test
-    @DisplayName("Webhook with invalid signature returns 401 UNAUTHORIZED")
+    @DisplayName("Webhook with invalid signature returns 401 INVALID_SIGNATURE")
     void invalidSignatureReturns401() throws Exception {
         when(this.webhookService.processWebhook(eq("fake"), any(), eq("invalid_sig")))
                 .thenThrow(new UnauthorizedException("Invalid webhook signature"));
@@ -51,20 +68,4 @@ class PaymentWebhookControllerTest {
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
     }
-
-    @Test
-    @DisplayName("Webhook with valid signature returns 200 OK")
-    void validWebhookReturns200() throws Exception {
-        when(this.webhookService.processWebhook(eq("fake"), any(), eq("valid_sig")))
-                .thenReturn("processed");
-
-        this.mockMvc.perform(post("/api/v1/payments/webhook/fake")
-                        .header("X-Signature", "valid_sig")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"eventId\":\"evt_1\",\"gatewayOrderId\":\"ord_1\"}"))
-                .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("ok"))
-                .andExpect(jsonPath("$.result").value("processed"));
-    }
 }
-

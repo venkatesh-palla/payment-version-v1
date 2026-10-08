@@ -13,11 +13,9 @@ import com.venkat.payment.gateway.model.PaymentVerificationResponse;
 import com.venkat.payment.repository.PaymentEventRepository;
 import com.venkat.payment.repository.PaymentRepository;
 import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -26,7 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Service processing incoming payment webhooks with cryptographic verification,
- * deduplication, out-of-band gateway verification, and status-guarded state updates.
+ * deduplication, gateway verification outside DB transactions, and transactional outbox state changes.
  */
 @Service
 public class PaymentWebhookService {
@@ -37,28 +35,23 @@ public class PaymentWebhookService {
     private final PaymentEventRepository paymentEventRepository;
     private final PaymentGatewayRegistry gatewayRegistry;
     private final PaymentStateMachine stateMachine;
+    private final PaymentStatusUpdateService statusUpdateService;
     private final ObjectMapper objectMapper;
 
     public PaymentWebhookService(final PaymentRepository paymentRepository,
                                  final PaymentEventRepository paymentEventRepository,
                                  final PaymentGatewayRegistry gatewayRegistry,
                                  final PaymentStateMachine stateMachine,
+                                 final PaymentStatusUpdateService statusUpdateService,
                                  final ObjectMapper objectMapper) {
         this.paymentRepository = paymentRepository;
         this.paymentEventRepository = paymentEventRepository;
         this.gatewayRegistry = gatewayRegistry;
         this.stateMachine = stateMachine;
+        this.statusUpdateService = statusUpdateService;
         this.objectMapper = objectMapper;
     }
 
-    /**
-     * Executes the strict 11-step webhook processing pipeline.
-     *
-     * @param gatewayName provider gateway name
-     * @param rawBody     unparsed byte payload
-     * @param signature   header signature
-     * @return processing outcome summary
-     */
     public String processWebhook(final String gatewayName, final byte[] rawBody, final String signature) {
         final PaymentGateway gateway = this.gatewayRegistry.getGateway(gatewayName);
 
@@ -143,19 +136,36 @@ public class PaymentWebhookService {
             return "mismatch_recorded";
         }
 
-        // 8. Decide new status from VERIFIED gateway response (never from webhook body)
+        // Check if QR was already successfully paid previously:
+        if (payment.getStatus() == PaymentStatus.SUCCESS && verified.status() == PaymentStatus.SUCCESS) {
+            log.info("Second webhook received for already paid payment [{}]. Deduped without extra events.",
+                    payment.getPaymentReference());
+            this.paymentEventRepository.insertEventIfNotExists(
+                    UUID.randomUUID(),
+                    payment.getId(),
+                    payload.eventId(),
+                    payload.eventType(),
+                    "WEBHOOK",
+                    rawPayloadJson
+            );
+            this.paymentEventRepository.markEventProcessed(payload.eventId());
+            return "already_paid";
+        }
+
+        // 8. Decide new status from VERIFIED gateway response
         final PaymentStatus verifiedStatus = verified.status() != null ? verified.status() : PaymentStatus.PENDING;
         final PaymentStatus currentStatus = payment.getStatus();
         PaymentStatus targetStatus = verifiedStatus;
         boolean requiresManualReview = false;
         String reviewReason = null;
+        boolean lateSuccess = false;
 
         if (verifiedStatus == PaymentStatus.SUCCESS) {
             if (currentStatus == PaymentStatus.EXPIRED) {
-                // Late payment after expiry allowed but flagged for review
                 requiresManualReview = true;
-                reviewReason = "LATE_PAYMENT_AFTER_EXPIRY";
+                reviewReason = "LATE_SUCCESS";
                 targetStatus = PaymentStatus.SUCCESS;
+                lateSuccess = true;
             } else if (!this.stateMachine.canTransition(currentStatus, PaymentStatus.SUCCESS)) {
                 log.info("Ignoring out-of-order transition from {} to SUCCESS for payment [{}]",
                         currentStatus, payment.getPaymentReference());
@@ -169,82 +179,38 @@ public class PaymentWebhookService {
             }
         }
 
-        // 9. Execute atomic status update and event deduplication in ONE DB transaction
-        final boolean updated = executeAtomicStatusUpdate(
+        // Record incoming event in payment_events table
+        final boolean inserted = this.paymentEventRepository.insertEventIfNotExists(
+                UUID.randomUUID(),
+                payment.getId(),
+                payload.eventId(),
+                payload.eventType(),
+                "WEBHOOK",
+                rawPayloadJson
+        );
+        if (!inserted) {
+            log.info("Duplicate race for event [{}]", payload.eventId());
+            return "duplicate";
+        }
+
+        // 9. Execute status transition + Outbox event generation in ONE transaction
+        final boolean updated = this.statusUpdateService.transitionStatusWithOutbox(
                 payment,
                 targetStatus,
                 verified.paidAt(),
                 verified.gatewayPaymentId(),
                 requiresManualReview,
                 reviewReason,
-                payload.eventId(),
-                payload.eventType(),
-                rawPayloadJson
+                lateSuccess
         );
 
+        this.paymentEventRepository.markEventProcessed(payload.eventId());
+
         if (updated) {
-            // 10. Trigger post-update hook
             onPaymentStatusChanged(payment, currentStatus, targetStatus);
         }
 
-        // 11. Return 200 OK
         return "processed";
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public boolean executeAtomicStatusUpdate(final Payment payment,
-                                             final PaymentStatus targetStatus,
-                                             final Instant paidAt,
-                                             final String gatewayPaymentId,
-                                             final boolean requiresManualReview,
-                                             final String reviewReason,
-                                             final String eventId,
-                                             final String eventType,
-                                             final String rawPayload) {
-        // Atomic insert event: ON CONFLICT DO NOTHING
-        final boolean inserted = this.paymentEventRepository.insertEventIfNotExists(
-                UUID.randomUUID(),
-                payment.getId(),
-                eventId,
-                eventType,
-                "WEBHOOK",
-                rawPayload
-        );
-
-        if (!inserted) {
-            log.info("Concurrent webhook event [{}] race detected. Skipping update.", eventId);
-            return false;
-        }
-
-        // Status-guarded update with version check
-        final Set<PaymentStatus> allowedStates = this.stateMachine.allowedFromStates(targetStatus);
-        final Set<String> allowedStateNames = allowedStates.stream()
-                .map(Enum::name)
-                .collect(Collectors.toSet());
-        // Also allow same-state idempotent update
-        allowedStateNames.add(targetStatus.name());
-        if (targetStatus == PaymentStatus.SUCCESS && payment.getStatus() == PaymentStatus.EXPIRED) {
-            allowedStateNames.add(PaymentStatus.EXPIRED.name());
-        }
-
-        final int rows = this.paymentRepository.updateStatusWithGuard(
-                payment.getId(),
-                targetStatus,
-                allowedStateNames,
-                paidAt,
-                gatewayPaymentId,
-                requiresManualReview,
-                reviewReason,
-                payment.getVersion()
-        );
-
-        if (rows == 0) {
-            log.info("Status-guarded update for payment [{}] produced 0 rows (out of order or version race)",
-                    payment.getPaymentReference());
-        }
-
-        this.paymentEventRepository.markEventProcessed(eventId);
-        return rows > 0;
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -275,11 +241,7 @@ public class PaymentWebhookService {
         this.paymentEventRepository.markEventProcessed(eventId);
     }
 
-    /**
-     * Level 1 status changed hook. In Level 2 this will insert an event into the transactional outbox.
-     */
     public void onPaymentStatusChanged(final Payment payment, final PaymentStatus oldStatus, final PaymentStatus newStatus) {
         log.info("Payment [{}] status changed from {} to {}", payment.getPaymentReference(), oldStatus, newStatus);
     }
 }
-

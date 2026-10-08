@@ -7,6 +7,7 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.dao.EmptyResultDataAccessException;
@@ -16,7 +17,8 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 
 /**
- * Spring JDBC repository for Payment entities.
+ * Spring JDBC repository for Payment entities with optimistic locking, status guards,
+ * and SKIP LOCKED scheduler queries.
  */
 @Repository
 public class PaymentRepository {
@@ -188,6 +190,73 @@ public class PaymentRepository {
         return this.jdbcTemplate.update(sql, params);
     }
 
+    /**
+     * Claims pending payments past expiration threshold using SKIP LOCKED.
+     */
+    public List<Payment> claimExpiredPendingPayments(final Instant expirationThreshold, final int limit) {
+        final String sql = """
+                SELECT * FROM payments
+                WHERE status = 'PENDING' AND expires_at < :expirationThreshold
+                ORDER BY expires_at ASC
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+                """;
+
+        return this.jdbcTemplate.query(
+                sql,
+                new MapSqlParameterSource()
+                        .addValue("expirationThreshold", Timestamp.from(expirationThreshold))
+                        .addValue("limit", limit),
+                this.rowMapper
+        );
+    }
+
+    /**
+     * Claims pending payments needing out-of-band verification using SKIP LOCKED.
+     */
+    public List<Payment> claimPaymentsNeedingVerification(final Instant now,
+                                                         final Instant minAgeThreshold,
+                                                         final int limit) {
+        final String sql = """
+                SELECT * FROM payments
+                WHERE status = 'PENDING'
+                  AND created_at < :minAgeThreshold
+                  AND (next_verification_at IS NULL OR next_verification_at <= :now)
+                ORDER BY COALESCE(next_verification_at, created_at) ASC
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED
+                """;
+
+        return this.jdbcTemplate.query(
+                sql,
+                new MapSqlParameterSource()
+                        .addValue("now", Timestamp.from(now))
+                        .addValue("minAgeThreshold", Timestamp.from(minAgeThreshold))
+                        .addValue("limit", limit),
+                this.rowMapper
+        );
+    }
+
+    /**
+     * Updates next verification scheduling details for backoff tracking.
+     */
+    public void updateNextVerification(final UUID id, final Instant nextVerificationAt, final int attempts) {
+        final String sql = """
+                UPDATE payments
+                SET next_verification_at = :nextVerificationAt,
+                    verification_attempts = :attempts,
+                    updated_at = NOW()
+                WHERE id = :id
+                """;
+
+        final MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("id", id)
+                .addValue("nextVerificationAt", nextVerificationAt != null ? Timestamp.from(nextVerificationAt) : null)
+                .addValue("attempts", attempts);
+
+        this.jdbcTemplate.update(sql, params);
+    }
+
     private static class PaymentRowMapper implements RowMapper<Payment> {
         @Override
         public Payment mapRow(final ResultSet rs, final int rowNum) throws SQLException {
@@ -223,4 +292,3 @@ public class PaymentRepository {
         }
     }
 }
-

@@ -1,12 +1,14 @@
 package com.venkat.payment.api;
 
-import com.venkat.payment.config.PaymentProperties;
+import com.venkat.payment.domain.Payment;
 import com.venkat.payment.service.PaymentService;
 import jakarta.validation.Valid;
 import java.util.UUID;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -16,43 +18,65 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * REST controller for payment creation and retrieval.
- * Controllers only validate, delegate, and map.
+ * REST controller for payment creation and retrieval with JWT scope and ownership authorization.
  */
 @RestController
 @RequestMapping("/api/v1/payments")
 public class PaymentController {
 
     private final PaymentService paymentService;
-    private final PaymentProperties paymentProperties;
 
-    public PaymentController(final PaymentService paymentService,
-                             final PaymentProperties paymentProperties) {
+    public PaymentController(final PaymentService paymentService) {
         this.paymentService = paymentService;
-        this.paymentProperties = paymentProperties;
     }
 
     @PostMapping
     public ResponseEntity<CreatePaymentResponse> createPayment(
-            @RequestHeader(value = "X-API-Key", required = false) final String apiKey,
+            @RequestHeader(value = "Idempotency-Key", required = false) final String idempotencyKey,
             @Valid @RequestBody final CreatePaymentRequest request) {
-        authenticateApiKey(apiKey);
-        final CreatePaymentResponse response = this.paymentService.createPayment(request);
+
+        if (idempotencyKey == null || idempotencyKey.trim().length() < 8 || idempotencyKey.trim().length() > 128) {
+            throw new MissingIdempotencyKeyException("Idempotency-Key header is required and must be between 8 and 128 characters");
+        }
+
+        final CreatePaymentResponse response = this.paymentService.createPayment(idempotencyKey.trim(), request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
     @GetMapping("/{paymentId}")
-    public ResponseEntity<PaymentResponse> getPayment(@PathVariable("paymentId") final UUID paymentId) {
-        final PaymentResponse response = this.paymentService.getPayment(paymentId);
+    public ResponseEntity<PaymentResponse> getPayment(
+            @PathVariable("paymentId") final UUID paymentId,
+            @AuthenticationPrincipal final Jwt jwt) {
+
+        final Payment payment = this.paymentService.getPaymentEntity(paymentId);
+
+        // Ownership enforcement: callers with only payments:read cannot read payments of other customers
+        if (jwt != null) {
+            final String scope = jwt.getClaimAsString("scope");
+            final boolean isInternal = scope != null && scope.contains("payments:internal");
+
+            if (!isInternal) {
+                final String callerSubject = jwt.getSubject();
+                if (payment.getCustomerId() == null || !payment.getCustomerId().equals(callerSubject)) {
+                    // Conceal existence to prevent customer resource enumeration
+                    throw new PaymentNotFoundException(paymentId);
+                }
+            }
+        }
+
+        final PaymentResponse response = new PaymentResponse(
+                payment.getId(),
+                payment.getPaymentReference(),
+                payment.getOrderId(),
+                payment.getStatus(),
+                payment.getAmount(),
+                payment.getCurrency(),
+                payment.getPaidAt(),
+                payment.getExpiresAt()
+        );
+
         return ResponseEntity.ok()
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
                 .body(response);
     }
-
-    private void authenticateApiKey(final String apiKey) {
-        if (apiKey == null || !apiKey.equals(this.paymentProperties.getApiKey())) {
-            throw new UnauthorizedException("Invalid or missing X-API-Key header");
-        }
-    }
 }
-

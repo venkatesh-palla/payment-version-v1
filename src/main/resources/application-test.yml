@@ -15,3 +15,5 @@ payment:
   fake-gateway-webhook-secret: test-secret-key
   dev:
     enabled: true
+  scheduler:
+    enabled: false

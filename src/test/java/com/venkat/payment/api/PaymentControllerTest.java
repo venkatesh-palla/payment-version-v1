@@ -3,7 +3,9 @@ package com.venkat.payment.api;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.venkat.payment.config.ClockConfig;
 import com.venkat.payment.config.PaymentProperties;
+import com.venkat.payment.domain.Payment;
 import com.venkat.payment.domain.PaymentStatus;
+import com.venkat.payment.security.SecurityConfig;
 import com.venkat.payment.service.PaymentService;
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -14,11 +16,14 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.when;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -26,7 +31,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(PaymentController.class)
-@Import({GlobalExceptionHandler.class, ClockConfig.class, PaymentProperties.class})
+@Import({GlobalExceptionHandler.class, ClockConfig.class, PaymentProperties.class, SecurityConfig.class})
 class PaymentControllerTest {
 
     @Autowired
@@ -39,19 +44,32 @@ class PaymentControllerTest {
     private PaymentService paymentService;
 
     @Test
-    @DisplayName("POST /api/v1/payments missing X-API-Key returns 401 UNAUTHORIZED")
-    void missingApiKeyReturns401() throws Exception {
+    @DisplayName("POST /api/v1/payments missing JWT token returns 401 UNAUTHORIZED")
+    void missingJwtReturns401() throws Exception {
         final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "INR", "CUST-1");
 
         this.mockMvc.perform(post("/api/v1/payments")
+                        .header("Idempotency-Key", "KEY-VALID-12345")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(this.objectMapper.writeValueAsString(request)))
-                .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+                .andExpect(status().isUnauthorized());
     }
 
     @Test
-    @DisplayName("POST /api/v1/payments with invalid input (negative amount) returns 400 VALIDATION_ERROR")
+    @DisplayName("POST /api/v1/payments missing Idempotency-Key returns 400 MISSING_IDEMPOTENCY_KEY")
+    void missingIdempotencyKeyReturns400() throws Exception {
+        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "INR", "CUST-1");
+
+        this.mockMvc.perform(post("/api/v1/payments")
+                        .with(jwt().authorities(() -> "SCOPE_payments:create"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(this.objectMapper.writeValueAsString(request)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("MISSING_IDEMPOTENCY_KEY"));
+    }
+
+    @Test
+    @DisplayName("POST /api/v1/payments with invalid input returns 400 VALIDATION_ERROR")
     void invalidInputReturns400() throws Exception {
         final String invalidPayload = """
                 {
@@ -62,7 +80,8 @@ class PaymentControllerTest {
                 """;
 
         this.mockMvc.perform(post("/api/v1/payments")
-                        .header("X-API-Key", "dev-api-key-12345")
+                        .with(jwt().authorities(() -> "SCOPE_payments:create"))
+                        .header("Idempotency-Key", "KEY-VALID-12345")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(invalidPayload))
                 .andExpect(status().isBadRequest())
@@ -78,10 +97,11 @@ class PaymentControllerTest {
                 paymentId, "PAY-ABC123456789", PaymentStatus.PENDING, new BigDecimal("500.00"), "INR", "upi://...", Instant.now().plusSeconds(900)
         );
 
-        when(this.paymentService.createPayment(any())).thenReturn(response);
+        when(this.paymentService.createPayment(eq("KEY-VALID-12345"), any())).thenReturn(response);
 
         this.mockMvc.perform(post("/api/v1/payments")
-                        .header("X-API-Key", "dev-api-key-12345")
+                        .with(jwt().authorities(() -> "SCOPE_payments:create"))
+                        .header("Idempotency-Key", "KEY-VALID-12345")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(this.objectMapper.writeValueAsString(request)))
                 .andExpect(status().isCreated())
@@ -91,16 +111,19 @@ class PaymentControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/payments/{id} returns 200 with Cache-Control: no-store")
-    void getPaymentReturns200WithNoStore() throws Exception {
+    @DisplayName("GET /api/v1/payments/{id} matching token subject returns 200 with Cache-Control: no-store")
+    void getPaymentOwnerSuccess() throws Exception {
         final UUID paymentId = UUID.randomUUID();
-        final PaymentResponse response = new PaymentResponse(
-                paymentId, "PAY-ABC123456789", "ORD-1", PaymentStatus.SUCCESS, new BigDecimal("500.00"), "INR", Instant.now(), Instant.now().plusSeconds(900)
+        final Payment payment = new Payment(
+                paymentId, "PAY-ABC123456789", "ORD-1", "customer-alice", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_1", "fake_pay_1", PaymentStatus.SUCCESS, "UPI", "upi://...", Instant.now().plusSeconds(900),
+                Instant.now(), false, null, 0, null, 1L, Instant.now(), Instant.now()
         );
 
-        when(this.paymentService.getPayment(paymentId)).thenReturn(response);
+        when(this.paymentService.getPaymentEntity(paymentId)).thenReturn(payment);
 
-        this.mockMvc.perform(get("/api/v1/payments/" + paymentId))
+        this.mockMvc.perform(get("/api/v1/payments/" + paymentId)
+                        .with(jwt().jwt(j -> j.subject("customer-alice").claim("scope", "payments:read"))))
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control", "no-store"))
                 .andExpect(jsonPath("$.paymentId").value(paymentId.toString()))
@@ -108,14 +131,39 @@ class PaymentControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/payments/{id} returns 404 when not found")
-    void getPaymentNotFoundReturns404() throws Exception {
+    @DisplayName("GET /api/v1/payments/{id} with different token subject returns 404 PAYMENT_NOT_FOUND (ownership concealed)")
+    void getPaymentForeignOwnerReturns404() throws Exception {
         final UUID paymentId = UUID.randomUUID();
-        when(this.paymentService.getPayment(paymentId)).thenThrow(new PaymentNotFoundException(paymentId));
+        final Payment payment = new Payment(
+                paymentId, "PAY-ABC123456789", "ORD-1", "customer-alice", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_1", "fake_pay_1", PaymentStatus.SUCCESS, "UPI", "upi://...", Instant.now().plusSeconds(900),
+                Instant.now(), false, null, 0, null, 1L, Instant.now(), Instant.now()
+        );
 
-        this.mockMvc.perform(get("/api/v1/payments/" + paymentId))
+        when(this.paymentService.getPaymentEntity(paymentId)).thenReturn(payment);
+
+        this.mockMvc.perform(get("/api/v1/payments/" + paymentId)
+                        .with(jwt().jwt(j -> j.subject("customer-bob").claim("scope", "payments:read"))))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("PAYMENT_NOT_FOUND"));
     }
-}
 
+    @Test
+    @DisplayName("GET /api/v1/payments/{id} with payments:internal scope bypasses ownership check")
+    void getPaymentInternalScopeBypassesOwnership() throws Exception {
+        final UUID paymentId = UUID.randomUUID();
+        final Payment payment = new Payment(
+                paymentId, "PAY-ABC123456789", "ORD-1", "customer-alice", new BigDecimal("500.00"), "INR", "fake",
+                "fake_ord_1", "fake_pay_1", PaymentStatus.SUCCESS, "UPI", "upi://...", Instant.now().plusSeconds(900),
+                Instant.now(), false, null, 0, null, 1L, Instant.now(), Instant.now()
+        );
+
+        when(this.paymentService.getPaymentEntity(paymentId)).thenReturn(payment);
+
+        this.mockMvc.perform(get("/api/v1/payments/" + paymentId)
+                        .with(jwt().jwt(j -> j.subject("internal-worker").claim("scope", "payments:internal"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.paymentId").value(paymentId.toString()))
+                .andExpect(jsonPath("$.status").value("SUCCESS"));
+    }
+}

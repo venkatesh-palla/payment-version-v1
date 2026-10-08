@@ -137,17 +137,32 @@ public class DemoPageController {
                         box.innerHTML = `[${time}] ${msg}<br>` + box.innerHTML;
                     }
 
+                    let currentToken = null;
+
+                    async function ensureToken() {
+                        if (currentToken) return currentToken;
+                        const res = await fetch('/dev/token?sub=customer-local-demo&scopes=payments:create,payments:read', { method: 'POST' });
+                        const data = await res.json();
+                        currentToken = data.access_token;
+                        return currentToken;
+                    }
+
                     async function createPayment() {
                         const orderId = document.getElementById('orderId').value;
                         const amount = parseFloat(document.getElementById('amount').value);
 
-                        log(`Creating payment for order ${orderId} of INR ${amount}...`);
+                        log(`Requesting authorization token...`);
+                        const token = await ensureToken();
+
+                        const idempotencyKey = 'DEMO-KEY-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
+                        log(`Creating payment for order ${orderId} of INR ${amount} (Idempotency: ${idempotencyKey})...`);
                         try {
                             const res = await fetch('/api/v1/payments', {
                                 method: 'POST',
                                 headers: {
                                     'Content-Type': 'application/json',
-                                    'X-API-Key': 'dev-api-key-12345'
+                                    'Authorization': 'Bearer ' + token,
+                                    'Idempotency-Key': idempotencyKey
                                 },
                                 body: JSON.stringify({
                                     orderId: orderId,
@@ -159,7 +174,7 @@ public class DemoPageController {
 
                             if (!res.ok) {
                                 const err = await res.json();
-                                log(`Error creating payment: ${err.message || res.statusText}`);
+                                log(`Error creating payment: [${err.code}] ${err.message || res.statusText}`);
                                 return;
                             }
 
@@ -187,8 +202,12 @@ public class DemoPageController {
                     async function pollPaymentStatus() {
                         if (!currentPaymentId) return;
                         try {
+                            const token = await ensureToken();
                             const res = await fetch('/api/v1/payments/' + currentPaymentId, {
-                                headers: { 'Cache-Control': 'no-store' }
+                                headers: {
+                                    'Authorization': 'Bearer ' + token,
+                                    'Cache-Control': 'no-store'
+                                }
                             });
                             if (res.ok) {
                                 const data = await res.json();

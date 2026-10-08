@@ -7,9 +7,11 @@ import com.venkat.payment.api.PaymentResponse;
 import com.venkat.payment.api.WebhookPayload;
 import com.venkat.payment.config.PaymentProperties;
 import com.venkat.payment.domain.PaymentStatus;
-import com.venkat.payment.gateway.fake.FakeGateway;
+import com.venkat.payment.security.JwtTokenService;
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -48,6 +50,7 @@ class PaymentWorkflowIT {
         registry.add("spring.datasource.username", postgres::getUsername);
         registry.add("spring.datasource.password", postgres::getPassword);
         registry.add("spring.flyway.enabled", () -> "true");
+        registry.add("payment.scheduler.enabled", () -> "false");
     }
 
     @LocalServerPort
@@ -60,20 +63,35 @@ class PaymentWorkflowIT {
     private PaymentProperties paymentProperties;
 
     @Autowired
+    private JwtTokenService jwtTokenService;
+
+    @Autowired
     private ObjectMapper objectMapper;
 
     private String baseUrl() {
         return "http://localhost:" + this.port;
     }
 
+    private HttpHeaders authHeaders(final String customerId, final String idempotencyKey) {
+        final String token = this.jwtTokenService.generateToken(customerId, List.of("payments:write", "payments:read"), 3600);
+        final HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        if (idempotencyKey != null) {
+            headers.set("Idempotency-Key", idempotencyKey);
+        }
+        return headers;
+    }
+
     @Test
     @DisplayName("End-to-end integration: create payment -> simulate success -> status becomes SUCCESS")
     void fullPaymentSuccessWorkflow() throws Exception {
+        final String customerId = "CUST-IT-1";
+        final String idempotencyKey = "IDEMP-IT-100";
+
         // 1. Create Payment
-        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-IT-100", new BigDecimal("500.00"), "INR", "CUST-IT-1");
-        final HttpHeaders headers = new HttpHeaders();
-        headers.set("X-API-Key", this.paymentProperties.getApiKey());
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-IT-100", new BigDecimal("500.00"), "INR", customerId);
+        final HttpHeaders headers = authHeaders(customerId, idempotencyKey);
 
         final ResponseEntity<CreatePaymentResponse> createRes = this.restTemplate.exchange(
                 baseUrl() + "/api/v1/payments",
@@ -98,8 +116,10 @@ class PaymentWorkflowIT {
         assertThat(simRes.getBody().get("status")).isEqualTo("SIMULATED");
 
         // 3. Verify payment query returns SUCCESS
-        final ResponseEntity<PaymentResponse> getRes = this.restTemplate.getForEntity(
+        final ResponseEntity<PaymentResponse> getRes = this.restTemplate.exchange(
                 baseUrl() + "/api/v1/payments/" + created.paymentId(),
+                HttpMethod.GET,
+                new HttpEntity<>(authHeaders(customerId, null)),
                 PaymentResponse.class
         );
         assertThat(getRes.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -113,11 +133,12 @@ class PaymentWorkflowIT {
     @Test
     @DisplayName("Duplicate webhook delivered twice modifies payment status exactly once")
     void duplicateWebhookChangesStateOnce() throws Exception {
+        final String customerId = "CUST-IT-2";
+        final String idempotencyKey = "IDEMP-IT-DUP";
+
         // 1. Create Payment
-        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-IT-DUP", new BigDecimal("750.00"), "INR", "CUST-IT-2");
-        final HttpHeaders headers = new HttpHeaders();
-        headers.set("X-API-Key", this.paymentProperties.getApiKey());
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-IT-DUP", new BigDecimal("750.00"), "INR", customerId);
+        final HttpHeaders headers = authHeaders(customerId, idempotencyKey);
 
         final ResponseEntity<CreatePaymentResponse> createRes = this.restTemplate.exchange(
                 baseUrl() + "/api/v1/payments",
@@ -146,8 +167,10 @@ class PaymentWorkflowIT {
         assertThat(simRes2.getBody().get("webhookOutcome")).isEqualTo("duplicate");
 
         // Check payment status is still SUCCESS
-        final ResponseEntity<PaymentResponse> getRes = this.restTemplate.getForEntity(
+        final ResponseEntity<PaymentResponse> getRes = this.restTemplate.exchange(
                 baseUrl() + "/api/v1/payments/" + created.paymentId(),
+                HttpMethod.GET,
+                new HttpEntity<>(authHeaders(customerId, null)),
                 PaymentResponse.class
         );
         assertThat(getRes.getBody().status()).isEqualTo(PaymentStatus.SUCCESS);
@@ -156,11 +179,12 @@ class PaymentWorkflowIT {
     @Test
     @DisplayName("Invalid signature webhook returns 401 and does not modify payment")
     void invalidSignatureFailsAndChangesNothing() throws Exception {
+        final String customerId = "CUST-IT-3";
+        final String idempotencyKey = "IDEMP-IT-BADSIG";
+
         // 1. Create Payment
-        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-IT-BADSIG", new BigDecimal("300.00"), "INR", "CUST-IT-3");
-        final HttpHeaders headers = new HttpHeaders();
-        headers.set("X-API-Key", this.paymentProperties.getApiKey());
-        headers.setContentType(MediaType.APPLICATION_JSON);
+        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-IT-BADSIG", new BigDecimal("300.00"), "INR", customerId);
+        final HttpHeaders headers = authHeaders(customerId, idempotencyKey);
 
         final ResponseEntity<CreatePaymentResponse> createRes = this.restTemplate.exchange(
                 baseUrl() + "/api/v1/payments",
@@ -190,11 +214,12 @@ class PaymentWorkflowIT {
         assertThat(webhookRes.getBody().get("code")).isEqualTo("UNAUTHORIZED");
 
         // 3. Status must remain PENDING
-        final ResponseEntity<PaymentResponse> getRes = this.restTemplate.getForEntity(
+        final ResponseEntity<PaymentResponse> getRes = this.restTemplate.exchange(
                 baseUrl() + "/api/v1/payments/" + created.paymentId(),
+                HttpMethod.GET,
+                new HttpEntity<>(authHeaders(customerId, null)),
                 PaymentResponse.class
         );
         assertThat(getRes.getBody().status()).isEqualTo(PaymentStatus.PENDING);
     }
 }
-

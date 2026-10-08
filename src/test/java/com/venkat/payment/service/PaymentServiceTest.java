@@ -1,7 +1,9 @@
 package com.venkat.payment.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.venkat.payment.api.CreatePaymentRequest;
 import com.venkat.payment.api.CreatePaymentResponse;
+import com.venkat.payment.api.IdempotencyKeyReusedException;
 import com.venkat.payment.api.InvalidInputException;
 import com.venkat.payment.api.PaymentGatewayUnavailableException;
 import com.venkat.payment.api.PaymentNotFoundException;
@@ -12,6 +14,8 @@ import com.venkat.payment.domain.PaymentStatus;
 import com.venkat.payment.gateway.PaymentGateway;
 import com.venkat.payment.gateway.PaymentGatewayRegistry;
 import com.venkat.payment.gateway.model.PaymentCreationResponse;
+import com.venkat.payment.repository.IdempotencyKeyRepository;
+import com.venkat.payment.repository.IdempotencyKeyRepository.IdempotencyRecord;
 import com.venkat.payment.repository.PaymentRepository;
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -29,6 +33,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -40,6 +45,9 @@ class PaymentServiceTest {
     private PaymentRepository paymentRepository;
 
     @Mock
+    private IdempotencyKeyRepository idempotencyRepository;
+
+    @Mock
     private PaymentGatewayRegistry gatewayRegistry;
 
     @Mock
@@ -47,19 +55,25 @@ class PaymentServiceTest {
 
     private PaymentStateMachine stateMachine;
     private PaymentProperties paymentProperties;
+    private ObjectMapper objectMapper;
     private Clock fixedClock;
     private PaymentService paymentService;
+
+    private static final String IDEMPOTENCY_KEY = "KEY-TEST-12345678";
 
     @BeforeEach
     void setUp() {
         this.stateMachine = new PaymentStateMachine();
         this.paymentProperties = new PaymentProperties();
+        this.objectMapper = new ObjectMapper().findAndRegisterModules();
         this.fixedClock = Clock.fixed(Instant.parse("2026-10-08T12:00:00Z"), ZoneOffset.UTC);
         this.paymentService = new PaymentService(
                 this.paymentRepository,
+                this.idempotencyRepository,
                 this.gatewayRegistry,
                 this.stateMachine,
                 this.paymentProperties,
+                this.objectMapper,
                 this.fixedClock
         );
     }
@@ -69,6 +83,7 @@ class PaymentServiceTest {
     void createPaymentSuccess() {
         final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "INR", "CUST-1");
 
+        when(this.idempotencyRepository.tryClaimKey(anyString(), eq(IDEMPOTENCY_KEY), anyString(), any())).thenReturn(true);
         when(this.gatewayRegistry.getGateway("fake")).thenReturn(this.paymentGateway);
         when(this.paymentRepository.insert(any(Payment.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
@@ -77,13 +92,54 @@ class PaymentServiceTest {
         when(this.paymentRepository.updateGatewayDetailsAndStatus(any(), eq("fake_ord_1"), eq("upi://pay?..."), eq(PaymentStatus.PENDING), eq(0L)))
                 .thenReturn(1);
 
-        final CreatePaymentResponse response = this.paymentService.createPayment(request);
+        final CreatePaymentResponse response = this.paymentService.createPayment(IDEMPOTENCY_KEY, request);
 
         assertThat(response.status()).isEqualTo(PaymentStatus.PENDING);
         assertThat(response.amount()).isEqualTo(new BigDecimal("500.00"));
         assertThat(response.currency()).isEqualTo("INR");
         assertThat(response.paymentReference()).startsWith("PAY-");
         assertThat(response.qrCode()).isEqualTo("upi://pay?...");
+        verify(this.idempotencyRepository).completeKey(anyString(), eq(IDEMPOTENCY_KEY), eq(201), anyString(), any());
+    }
+
+    @Test
+    @DisplayName("Idempotent create with same key and same body returns cached response")
+    void createPaymentIdempotentCached() throws Exception {
+        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "INR", "CUST-1");
+        final String requestHash = PaymentService.computeRequestHash(request);
+
+        final CreatePaymentResponse cachedResponse = new CreatePaymentResponse(
+                UUID.randomUUID(), "PAY-CACHED12345", PaymentStatus.PENDING, new BigDecimal("500.00"), "INR", "upi://...", Instant.now().plusSeconds(900)
+        );
+        final String cachedJson = this.objectMapper.writeValueAsString(cachedResponse);
+
+        when(this.idempotencyRepository.tryClaimKey(anyString(), eq(IDEMPOTENCY_KEY), eq(requestHash), any())).thenReturn(false);
+        final IdempotencyRecord existingRecord = new IdempotencyRecord(
+                "PAYMENT_CREATE", IDEMPOTENCY_KEY, requestHash, "COMPLETED", 201, cachedJson, cachedResponse.paymentId(), Instant.now(), Instant.now().plusSeconds(3600)
+        );
+        when(this.idempotencyRepository.findByKey(anyString(), eq(IDEMPOTENCY_KEY))).thenReturn(Optional.of(existingRecord));
+
+        final CreatePaymentResponse response = this.paymentService.createPayment(IDEMPOTENCY_KEY, request);
+
+        assertThat(response.paymentReference()).isEqualTo("PAY-CACHED12345");
+        assertThat(response.status()).isEqualTo(PaymentStatus.PENDING);
+    }
+
+    @Test
+    @DisplayName("Idempotent create with same key but different body throws 422 IDEMPOTENCY_KEY_REUSED")
+    void createPaymentIdempotentKeyReusedDifferentBody() {
+        final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "INR", "CUST-1");
+        final String currentHash = PaymentService.computeRequestHash(request);
+
+        when(this.idempotencyRepository.tryClaimKey(anyString(), eq(IDEMPOTENCY_KEY), eq(currentHash), any())).thenReturn(false);
+        final IdempotencyRecord existingRecord = new IdempotencyRecord(
+                "PAYMENT_CREATE", IDEMPOTENCY_KEY, "different_sha256_hash", "COMPLETED", 201, "{}", UUID.randomUUID(), Instant.now(), Instant.now().plusSeconds(3600)
+        );
+        when(this.idempotencyRepository.findByKey(anyString(), eq(IDEMPOTENCY_KEY))).thenReturn(Optional.of(existingRecord));
+
+        assertThatThrownBy(() -> this.paymentService.createPayment(IDEMPOTENCY_KEY, request))
+                .isInstanceOf(IdempotencyKeyReusedException.class)
+                .hasMessageContaining("Idempotency key has already been used with different parameters");
     }
 
     @Test
@@ -91,11 +147,12 @@ class PaymentServiceTest {
     void createPaymentGatewayFailure() {
         final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "INR", "CUST-1");
 
+        when(this.idempotencyRepository.tryClaimKey(anyString(), eq(IDEMPOTENCY_KEY), anyString(), any())).thenReturn(true);
         when(this.gatewayRegistry.getGateway("fake")).thenReturn(this.paymentGateway);
         when(this.paymentRepository.insert(any(Payment.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(this.paymentGateway.createPayment(any())).thenThrow(new RuntimeException("Timeout connecting to provider"));
 
-        assertThatThrownBy(() -> this.paymentService.createPayment(request))
+        assertThatThrownBy(() -> this.paymentService.createPayment(IDEMPOTENCY_KEY, request))
                 .isInstanceOf(PaymentGatewayUnavailableException.class)
                 .hasMessageContaining("Payment gateway creation failed");
 
@@ -107,7 +164,7 @@ class PaymentServiceTest {
     void disallowedCurrencyFails() {
         final CreatePaymentRequest request = new CreatePaymentRequest("ORD-1", new BigDecimal("500.00"), "EUR", "CUST-1");
 
-        assertThatThrownBy(() -> this.paymentService.createPayment(request))
+        assertThatThrownBy(() -> this.paymentService.createPayment(IDEMPOTENCY_KEY, request))
                 .isInstanceOf(InvalidInputException.class)
                 .hasMessageContaining("Currency EUR is not allowed");
     }
@@ -139,4 +196,3 @@ class PaymentServiceTest {
                 .hasMessageContaining(id.toString());
     }
 }
-

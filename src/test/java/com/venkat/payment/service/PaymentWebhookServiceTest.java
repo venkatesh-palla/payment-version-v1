@@ -28,7 +28,6 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -49,6 +48,9 @@ class PaymentWebhookServiceTest {
     @Mock
     private PaymentGateway paymentGateway;
 
+    @Mock
+    private PaymentStatusUpdateService statusUpdateService;
+
     private PaymentStateMachine stateMachine;
     private ObjectMapper objectMapper;
     private PaymentWebhookService webhookService;
@@ -65,6 +67,7 @@ class PaymentWebhookServiceTest {
                 this.paymentEventRepository,
                 this.gatewayRegistry,
                 this.stateMachine,
+                this.statusUpdateService,
                 this.objectMapper
         );
         when(this.gatewayRegistry.getGateway(GATEWAY_NAME)).thenReturn(this.paymentGateway);
@@ -143,7 +146,7 @@ class PaymentWebhookServiceTest {
     }
 
     @Test
-    @DisplayName("Verified SUCCESS payment updates status to SUCCESS atomically")
+    @DisplayName("Verified SUCCESS payment updates status to SUCCESS atomically with outbox")
     void successWebhookUpdatesStatus() throws Exception {
         final Payment payment = createTestPayment(PaymentStatus.PENDING);
         final byte[] rawBody = createPayloadBytes("evt_success", payment.getGatewayOrderId());
@@ -162,11 +165,10 @@ class PaymentWebhookServiceTest {
                 Instant.now()
         );
         when(this.paymentGateway.verifyPayment(payment.getGatewayOrderId())).thenReturn(verifiedResponse);
-
         when(this.paymentEventRepository.insertEventIfNotExists(any(), eq(payment.getId()), eq("evt_success"), any(), eq("WEBHOOK"), any()))
                 .thenReturn(true);
-        when(this.paymentRepository.updateStatusWithGuard(eq(payment.getId()), eq(PaymentStatus.SUCCESS), anyCollection(), any(), eq("fake_pay_success"), eq(false), any(), eq(0L)))
-                .thenReturn(1);
+        when(this.statusUpdateService.transitionStatusWithOutbox(eq(payment), eq(PaymentStatus.SUCCESS), any(), eq("fake_pay_success"), eq(false), any(), eq(false)))
+                .thenReturn(true);
 
         final String result = this.webhookService.processWebhook(GATEWAY_NAME, rawBody, VALID_SIGNATURE);
 
@@ -194,11 +196,10 @@ class PaymentWebhookServiceTest {
                 null
         );
         when(this.paymentGateway.verifyPayment(payment.getGatewayOrderId())).thenReturn(verifiedResponse);
-
         when(this.paymentEventRepository.insertEventIfNotExists(any(), eq(payment.getId()), eq("evt_fail"), any(), eq("WEBHOOK"), any()))
                 .thenReturn(true);
-        when(this.paymentRepository.updateStatusWithGuard(eq(payment.getId()), eq(PaymentStatus.FAILED), anyCollection(), any(), eq("fake_pay_fail"), eq(false), any(), eq(0L)))
-                .thenReturn(1);
+        when(this.statusUpdateService.transitionStatusWithOutbox(eq(payment), eq(PaymentStatus.FAILED), any(), eq("fake_pay_fail"), eq(false), any(), eq(false)))
+                .thenReturn(true);
 
         final String result = this.webhookService.processWebhook(GATEWAY_NAME, rawBody, VALID_SIGNATURE);
 
@@ -231,7 +232,6 @@ class PaymentWebhookServiceTest {
         final String result = this.webhookService.processWebhook(GATEWAY_NAME, rawBody, VALID_SIGNATURE);
 
         assertThat(result).isEqualTo("mismatch_recorded");
-        // Verify update set requiresManualReview = true with reason AMOUNT_MISMATCH
         verify(this.paymentRepository).updateStatusWithGuard(
                 eq(payment.getId()),
                 eq(PaymentStatus.PENDING),
@@ -304,7 +304,7 @@ class PaymentWebhookServiceTest {
         final String result = this.webhookService.processWebhook(GATEWAY_NAME, rawBody, VALID_SIGNATURE);
 
         assertThat(result).isEqualTo("ignored_out_of_order");
-        verify(this.paymentRepository, never()).updateStatusWithGuard(any(), any(), any(), any(), any(), anyBoolean(), any(), anyLong());
+        verify(this.statusUpdateService, never()).transitionStatusWithOutbox(any(), any(), any(), any(), anyBoolean(), any(), anyBoolean());
     }
 
     @Test
@@ -345,11 +345,10 @@ class PaymentWebhookServiceTest {
                 Instant.now()
         );
         when(this.paymentGateway.verifyPayment(payment.getGatewayOrderId())).thenReturn(verifiedResponse);
-
         when(this.paymentEventRepository.insertEventIfNotExists(any(), eq(payment.getId()), eq("evt_late_success"), any(), eq("WEBHOOK"), any()))
                 .thenReturn(true);
-        when(this.paymentRepository.updateStatusWithGuard(eq(payment.getId()), eq(PaymentStatus.SUCCESS), anyCollection(), any(), eq("fake_pay_late"), eq(true), eq("LATE_PAYMENT_AFTER_EXPIRY"), eq(0L)))
-                .thenReturn(1);
+        when(this.statusUpdateService.transitionStatusWithOutbox(eq(payment), eq(PaymentStatus.SUCCESS), any(), eq("fake_pay_late"), eq(true), eq("LATE_SUCCESS"), eq(true)))
+                .thenReturn(true);
 
         final String result = this.webhookService.processWebhook(GATEWAY_NAME, rawBody, VALID_SIGNATURE);
 
@@ -357,4 +356,3 @@ class PaymentWebhookServiceTest {
         verify(this.paymentEventRepository).markEventProcessed("evt_late_success");
     }
 }
-

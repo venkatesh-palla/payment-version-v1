@@ -1,94 +1,82 @@
-# Level 1 Progress: QR-Based UPI Payment Service
+# Project Progress: QR-Based UPI Payment Service
 
-Tracking progress for **Level 1 (INITIAL): Build the QR Payment Service From Scratch, Working End to End Locally**.
+Tracking progress for **Level 1 (INITIAL)** and **Level 2 (MEDIUM): Make It Reliable**.
 
 ---
 
-## Level 1 Roadmap & Status
+## Level 1 Roadmap & Status (Completed)
 
 - [x] **Step 1.1: Bootstrap**
-  - Project skeleton: `pom.xml` (Java 21, Spring Boot 3.4.5, Spring JDBC, Validation, Actuator, PostgreSQL, Flyway, ZXing, Testcontainers, springdoc-openapi)
-  - Spring Boot app entry point (`PaymentApplication.java`)
-  - UTC `Clock` bean configuration (`ClockConfig.java`)
-  - Validated configuration properties (`PaymentProperties.java`)
-  - Environment profiles: `application.yml`, `application-local.yml`, `application-test.yml`
-  - `docker-compose.yml` with PostgreSQL 15 only (healthcheck, named volume, port 5432)
-  - `.env.example` with dummy environment defaults
-  - `Makefile` with targets: `db-up`, `db-down`, `run`, `test`, `verify`
-  - Tests green: `PaymentApplicationTest`, `ArchitectureTest`
-
 - [x] **Step 1.2: Database (Flyway V1)**
-  - Created `V1__init.sql` migration with explicit constraint/index names, `TIMESTAMPTZ`, and status checks
-  - `payments` table with `id UUID PK`, `payment_reference UNIQUE`, `amount > 0`, `status IN (...)`, optimistic lock `version`, etc.
-  - `payment_events` table for audit log and deduplication (`event_id UNIQUE`, `source`, `payload JSONB`, `processed`)
-  - Indexed: `order_id`, `gateway_order_id`, `gateway_payment_id`, `status`, `expires_at`, `event_id`, `payment_id`
-
 - [x] **Step 1.3: Domain + State Machine**
-  - `PaymentStatus` enum (8 values: `CREATED`, `QR_GENERATED`, `PENDING`, `SUCCESS`, `FAILED`, `EXPIRED`, `CANCELLED`, `REFUNDED`)
-  - `PaymentStateMachine` single source of truth for all transitions
-  - Self-transitions treated as harmless no-ops
-  - Illegal transitions throw `InvalidStateTransitionException`
-  - Methods: `canTransition(from, to)`, `validate(from, to)`, `allowedFromStates(to)`
-  - Parameterized unit tests over full 8x8 matrix (all 64 state pairs) passing green
-
 - [x] **Step 1.4: Gateway Abstraction + FakeGateway**
-  - `PaymentGateway` interface: `gatewayName()`, `createPayment()`, `verifyPayment()`, `verifyWebhookSignature()`
-  - Model records: `CreatePaymentGatewayRequest`, `PaymentCreationResponse`, `PaymentVerificationResponse`
-  - `PaymentGatewayRegistry` dynamically discovers and routes by gateway identifier
-  - `FakeGateway` implementation: in-memory `ConcurrentHashMap`, UPI string generator (`upi://pay?pa=fake@bank...`), HMAC-SHA256 signature verification in constant time (`MessageDigest.isEqual`), fallback to `PENDING` for unrecognized states
-  - Unit tests for HMAC signatures (valid, tampered payload, invalid secret, null/missing) passing green
-
 - [x] **Step 1.5: Create and Read Payment APIs**
-  - `POST /api/v1/payments`:
-    - `X-API-Key` authentication against `payment.api-key`
-    - Validates orderId (not blank, max 64), amount (> 0, max 2 decimals), currency (in allow-list `INR`)
-    - DB transaction 1: persist payment in `CREATED` state
-    - Invokes `gateway.createPayment` outside open DB transactions
-    - On gateway failure: marks `FAILED` and returns HTTP 503
-    - DB transaction 2: updates gateway order id + QR string, moves `CREATED` -> `QR_GENERATED` -> `PENDING`
-    - Returns HTTP 201 with `paymentId`, `paymentReference` (`PAY-` + 12 chars), `status: PENDING`, `qrCode`, `expiresAt`
-  - `GET /api/v1/payments/{paymentId}`:
-    - Returns `PaymentResponse` with `Cache-Control: no-store`
-    - Throws `PaymentNotFoundException` (HTTP 404) if not found
-  - `GlobalExceptionHandler` returning consistent `{ "code", "message", "timestamp" }` JSON envelope
-
 - [x] **Step 1.6: Webhook (Verification & Deduplication)**
-  - `POST /api/v1/payments/webhook/{gateway}`:
-    - Strict raw bytes inspection before parsing
-    - HMAC signature verification; rejects invalid with 401 (no payload dump)
-    - JSON parsing to `WebhookPayload`; rejects malformed with 400
-    - Deduplication: checks if `event_id` already processed; returns 200 without duplicate updates
-    - Unknown payment: logs warning, records audit event, returns 200
-    - Calls `gateway.verifyPayment(...)` outside open DB transactions; returns 503 if gateway down
-    - Verifies amount, currency, and gateway order id; on mismatch flags `requires_manual_review = true` and records reason
-    - Status decided strictly from verified gateway response (never webhook body)
-    - Single atomic DB transaction: `ON CONFLICT (event_id) DO NOTHING` + status-guarded optimistic locking update + marks event processed
-    - Handles late payments on `EXPIRED` orders by permitting `EXPIRED` -> `SUCCESS` with review flag
-    - `onPaymentStatusChanged` hook invoked post-commit (ready for Level 2 outbox)
-  - Unit tests covering all 10 edge cases passing green
-
 - [x] **Step 1.7: Simulator + Demo Page (Profile local/test only)**
-  - `POST /dev/fake-gateway/{paymentReference}/simulate?result=success|failed|pending|amount_mismatch|duplicate`
-    - Updates FakeGateway in-memory order state
-    - Crafts authentic signed webhook with HMAC-SHA256
-    - Dispatches to real webhook pipeline
-  - `GET /dev/pay-demo`: Interactive web UI with QR rendering, live status badge polling every 3 seconds, and simulation action buttons
-  - `GET /dev/qr/{paymentReference}`: Serves raw PNG image of UPI QR generated via ZXing
-  - `DevStartupLogger`: Logs loud startup warning; forbids loading under `prod` profile
-
 - [x] **Step 1.8: Tests + Docs**
-  - 100 comprehensive unit tests passing cleanly (`mvn test`)
-  - Integration test suite (`PaymentWorkflowIT`) using Testcontainers PostgreSQL
-  - Complete `README.md` with prerequisites, setup commands, cURL examples, and architecture map
 
 ---
 
-## Level 1 Done Checklist
+## Level 2 Roadmap & Status (Completed)
 
-- [x] `mvn test` (100 unit tests) passes cleanly.
-- [x] `make db-up && make run`, demo page at `http://localhost:8080/dev/pay-demo` completes simulated payments.
-- [x] Invalid signature returns 401 and changes nothing.
-- [x] Sending duplicate webhook twice updates payment once.
-- [x] Amount mismatch does NOT mark SUCCESS and sets manual review flag.
-- [x] No secrets committed; `.env.example` has dummy values only.
-- [x] `docs/PROGRESS.md` is fully updated.
+- [x] **Step 2.1: Migration V2 (New Tables & Partial Indexes)**
+  - `idempotency_keys` table with `(scope, idempotency_key)` PK, `request_hash`, `status`, `response_body JSONB`, `payment_id`
+  - `payment_outbox` table with `sequence_no BIGSERIAL`, `event_id UNIQUE`, `status (PENDING/DELIVERED/FAILED)`, `retry_count`, `next_retry_at`
+  - `payment_business_process` table with `status (PENDING/PROCESSING/COMPLETED/FAILED)`, `UNIQUE (payment_id, process_type)`
+  - `consumer_processed_events` table for downstream deduplication with `(event_id, consumer_name)` PK
+  - `shedlock` table for multi-instance scheduler synchronization
+  - Partial unique index `uq_payments_active_order` ensuring at most one ACTIVE payment per order
+  - Partial indexes `idx_payments_pending_expires_at` and `idx_payments_pending_next_verification_at`
+- [x] **Step 2.2: Idempotent Create-Payment API**
+  - Mandatory `Idempotency-Key` header with canonical SHA-256 payload validation
+  - In-progress concurrent requests return 409 Conflict with `Retry-After: 2`
+  - Duplicate requests with identical payload return cached 201 response
+  - Reusing idempotency key with modified payload returns 422 Unprocessable Entity
+  - Enforced single active payment per order via `uq_payments_active_order`
+- [x] **Step 2.3: Mismatch Handling, Late Success, Review Flag**
+  - Amount/currency mismatch flags payment with `requires_manual_review = true` and `review_reason`
+  - Late success on expired payment transitions status with manual review flag
+- [x] **Step 2.4: Transactional Outbox**
+  - Status transitions and outbox event insertions execute inside the same ACID transaction
+  - Deterministic event IDs (`<paymentId>:<EVENT_TYPE>`) eliminate duplicate outbox entries
+- [x] **Step 2.5: Event Delivery Without a Broker**
+  - In-process Spring Application Event delivery (`InProcessEventPublisher`)
+  - Signed HTTP callback delivery (`HttpCallbackEventPublisher`) with HMAC signature and exponential backoff
+  - Pull API (`InternalEventsController`) with sequence-based pagination (`/api/v1/internal/events`)
+  - Periodic outbox polling dispatcher with ShedLock and `SKIP LOCKED`
+- [x] **Step 2.6: Downstream Handler + Business Process Worker**
+  - `DownstreamEventHandler` with atomic `consumer_processed_events` deduplication
+  - `BusinessProcessWorker` executing background business tasks without downgrading payment status
+- [x] **Step 2.7: Schedulers (Expiry, Verification, Dispatcher, Worker with ShedLock)**
+  - `PaymentExpiryScheduler`: periodic expiration of overdue payments
+  - `PaymentVerificationScheduler`: fallback polling for payments that missed webhooks
+  - ShedLock JDBC distributed locking ensures safety in multi-instance environments
+- [x] **Step 2.8: Local JWT Auth + Ownership**
+  - Spring Security OAuth2 Resource Server with HS256 JWT validation
+  - Role/scope authorization (`payments:write`, `payments:read`, `payments:internal`)
+  - Customer ownership verification: customer callers can only read their own payments; 404 returned on customer mismatch to prevent enumeration
+  - Local token minting utility via `scripts/token.sh` and `/dev/token`
+- [x] **Step 2.9: Errors, Correlation IDs, Structured Logging**
+  - Standardized error format with machine-readable codes and `correlationId`
+  - CorrelationId filter injecting `X-Correlation-Id` into MDC and response headers
+  - JSON log formatting with Logstash Logback encoder
+- [x] **Step 2.10: Failure and Concurrency Tests**
+  - 20 concurrent requests with same idempotency key create exactly 1 payment without errors
+  - Outbox delivery retries on downstream HTTP failure and completes when restored
+  - Downstream business process failure never impacts or downgrades payment SUCCESS
+  - Expiry and verification schedulers tested with injectable fixed `Clock`
+
+---
+
+## Level 2 Done Checklist
+
+- [x] `mvn clean test` passes (109 tests green), including concurrency, scheduler, outbox, and failure suites.
+- [x] Same `Idempotency-Key` never creates two payments.
+- [x] Same webhook twice never creates two events or two business processes.
+- [x] Stopping callback receiver loses no events; restarting delivers them.
+- [x] Payment missing webhook is fixed by verification scheduler.
+- [x] Unpaid payments become EXPIRED automatically; paid ones are never expired.
+- [x] Failed downstream processing never changes a SUCCESS payment.
+- [x] JWT scopes and ownership work; webhook works without JWT.
+- [x] Logs show correlation IDs and contain no secrets.
+- [x] `docs/PROGRESS.md` updated; README updated with idempotency, outbox, schedulers, and JWT auth.

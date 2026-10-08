@@ -1,6 +1,6 @@
 # UPI QR Payment Service (payment-service)
 
-A production-grade, local-first UPI dynamic QR payment service built with **Java 21**, **Spring Boot 3.4.5**, **Spring JDBC**, **PostgreSQL**, and **Flyway**. Designed to run completely on your laptop with zero external cloud dependencies and zero message brokers.
+A production-grade, local-first UPI dynamic QR payment service built with **Java 21**, **Spring Boot 3.4.5**, **Spring JDBC**, **PostgreSQL**, and **Flyway**. Hardened for reliability with idempotency keys, transactional outbox, downstream business process workers, automated fallback schedulers, and JWT authentication with ownership checks. Designed to run completely on your laptop with zero external cloud dependencies and zero message brokers.
 
 ---
 
@@ -22,7 +22,7 @@ make db-up
 ### 2. Run Test Suite
 ```bash
 make test
-# Executes all 100 unit tests (State Machine matrix, FakeGateway HMAC, Webhook edge cases, Services)
+# Executes all 109 automated unit, concurrency, scheduler, failure, and security tests
 ```
 
 ### 3. Run Locally
@@ -42,84 +42,73 @@ http://localhost:8080/dev/pay-demo
 
 ---
 
-## 3. Environment Variables
+## 3. Level 2 Reliability Features
 
-| Variable | Default (Local) | Description |
-|---|---|---|
-| `DATABASE_URL` | `jdbc:postgresql://localhost:5432/payment_db` | PostgreSQL JDBC connection URL |
-| `DATABASE_NAME` | `payment_db` | PostgreSQL database name |
-| `DATABASE_USERNAME` | `payment_user` | PostgreSQL database username |
-| `DATABASE_PASSWORD` | `payment_secret` | PostgreSQL database password |
-| `PORT` | `8080` | Application HTTP port |
-| `SPRING_PROFILES_ACTIVE` | `local` | Active Spring profile (`local`, `test`, `prod`) |
-| `PAYMENT_GATEWAY` | `fake` | Selected payment provider (`fake`) |
-| `APP_API_KEY` | `dev-api-key-12345` | API key required in `X-API-Key` header |
-| `FAKE_GATEWAY_WEBHOOK_SECRET` | `fake-webhook-secret-key-12345` | Secret for HMAC-SHA256 webhook signatures |
+### 1. Idempotent Payment Creation
+- Every `POST /api/v1/payments` requires an `Idempotency-Key` HTTP header.
+- A canonical SHA-256 hash of the request body is stored with a unique composite key `(scope, idempotency_key)`.
+- Concurrent in-flight requests return `HTTP 409 Conflict` with `Retry-After: 2`.
+- Subsequent identical requests return the cached `HTTP 201 Created` response.
+- Reusing an existing key with a modified payload returns `HTTP 422 Unprocessable Entity`.
+- Only **one active payment per order** is permitted at any given time (enforced via partial unique index).
+
+### 2. Transactional Outbox Pattern
+- Every payment status change updates the `payments` table and writes a domain event to `payment_outbox` in the **same atomic database transaction**.
+- Deterministic event IDs (`<paymentId>:<EVENT_TYPE>`) eliminate duplicate outbox entries.
+- Events are dispatched asynchronously via:
+  1. **In-process Spring Events** (`InProcessEventPublisher`).
+  2. **Signed HTTP Callbacks** (`HttpCallbackEventPublisher`) with HMAC-SHA256 headers, exponential backoff, and retry jitter.
+  3. **Pull API** (`GET /api/v1/internal/events?afterSequenceNo=...`) with sequence-based pagination for external consumers.
+
+### 3. Downstream Worker & Isolation
+- Downstream events are deduplicated via atomic `consumer_processed_events` records.
+- Initiates business processes (e.g. `ORDER_FULFILLMENT`) handled by background worker tasks.
+- Downstream process errors or exhausted retries **never downgrade or impact** an authoritative payment's `SUCCESS` status.
+
+### 4. Resilient Schedulers (Multi-Instance Safe via ShedLock)
+- **Payment Expiry Scheduler**: Periodically identifies expired unpaid payments, checks gateway once, and marks them `EXPIRED` with transactional outbox emission.
+- **Payment Verification Scheduler**: Catches pending payments that missed webhooks, polling the gateway with gentle exponential backoff and transitioning confirmed payments to `SUCCESS`.
+- **Payment Outbox Dispatcher**: Sweeps pending outbox events every 2 seconds with `SKIP LOCKED`.
+- All schedulers use `ShedLock` over JDBC, ensuring zero duplicate executions across multiple service instances.
+
+### 5. Local JWT Authentication & Ownership Checks
+- Secures payment endpoints with HS256 JWT tokens.
+- Required scopes: `payments:write` to create payments, `payments:read` to inspect payments, `payments:internal` to read any payment or pull outbox events.
+- **Ownership verification**: Customer tokens can only read payments belonging to their `customerId`. Calls targeting another customer's payment return `HTTP 404 Not Found` to prevent account enumeration.
+- Webhook callbacks remain accessible without JWTs, secured by raw-byte HMAC-SHA256 signatures.
 
 ---
 
-## 4. Package & Folder Structure
+## 4. Minting Development JWT Tokens
 
+Generate tokens for local testing using the provided script:
+```bash
+# Mint a token for customer "CUST-101" with read & write permissions:
+./scripts/token.sh --sub CUST-101 --scopes payments:read,payments:write
+
+# Mint an internal admin token:
+./scripts/token.sh --sub ADMIN-SERVICE --scopes payments:internal,payments:read,payments:write
 ```
-src/main/java/com/venkat/payment/
-├── PaymentApplication.java             # Spring Boot main entrypoint
-├── api/
-│   ├── CreatePaymentRequest.java       # Validated creation payload
-│   ├── CreatePaymentResponse.java      # 201 response with QR data & expiry
-│   ├── PaymentResponse.java            # Payment read response
-│   ├── ErrorResponse.java              # Standard error envelope {code, message, timestamp}
-│   ├── WebhookPayload.java             # Gateway webhook JSON payload
-│   ├── PaymentController.java          # POST /api/v1/payments & GET /api/v1/payments/{id}
-│   ├── PaymentWebhookController.java   # POST /api/v1/payments/webhook/{gateway}
-│   ├── GlobalExceptionHandler.java     # Exception translations to standard error JSON
-│   ├── PaymentNotFoundException.java
-│   ├── PaymentGatewayUnavailableException.java
-│   ├── UnauthorizedException.java
-│   └── InvalidInputException.java
-├── config/
-│   ├── ClockConfig.java                # UTC system clock bean
-│   └── PaymentProperties.java          # Type-safe validated configuration
-├── domain/
-│   ├── Payment.java                    # Payment domain entity
-│   └── PaymentStatus.java              # CREATED, QR_GENERATED, PENDING, SUCCESS, FAILED, EXPIRED, CANCELLED, REFUNDED
-├── gateway/
-│   ├── PaymentGateway.java             # Core gateway interface
-│   ├── PaymentGatewayRegistry.java     # Gateway lookup registry
-│   ├── fake/FakeGateway.java           # In-memory simulator gateway with HMAC-SHA256
-│   └── model/
-│       ├── CreatePaymentGatewayRequest.java
-│       ├── PaymentCreationResponse.java
-│       └── PaymentVerificationResponse.java
-├── repository/
-│   ├── PaymentRepository.java          # Spring JDBC with optimistic locking & status guards
-│   └── PaymentEventRepository.java     # Audit log & ON CONFLICT webhook deduplication
-├── service/
-│   ├── PaymentService.java             # Payment orchestration outside DB transactions
-│   ├── PaymentWebhookService.java      # 11-step webhook pipeline with signature verification
-│   ├── PaymentStateMachine.java        # Single source of truth for allowed state transitions
-│   └── InvalidStateTransitionException.java
-└── dev/
-    ├── DevStartupLogger.java           # Startup warning for active dev endpoints
-    ├── FakeGatewaySimulatorController.java # POST /dev/fake-gateway/{ref}/simulate
-    └── DemoPageController.java         # GET /dev/pay-demo & GET /dev/qr/{ref}
 
-src/main/resources/
-├── db/migration/V1__init.sql          # Flyway migration: payments & payment_events
-├── application.yml                    # Default application configuration
-├── application-local.yml              # Local developer overrides
-├── application-test.yml               # Test profile configuration
-└── logback-spring.xml                 # Console log formatter with UTC timestamps
+Alternatively, call the local developer endpoint (available in `local` and `test` profiles):
+```bash
+curl -i -X POST http://localhost:8080/dev/token \
+  -H "Content-Type: application/json" \
+  -d '{"subject":"CUST-101","scopes":["payments:read","payments:write"]}'
 ```
 
 ---
 
 ## 5. cURL Examples
 
-### 1. Create Payment
+### 1. Create Payment (Idempotent & Authenticated)
 ```bash
+TOKEN=$(./scripts/token.sh --sub cust-user-1 --scopes payments:write,payments:read)
+
 curl -i -X POST http://localhost:8080/api/v1/payments \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: KEY-$(uuidgen)" \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: dev-api-key-12345" \
   -d '{
     "orderId": "ORDER-101",
     "amount": 500.00,
@@ -140,9 +129,10 @@ curl -i -X POST http://localhost:8080/api/v1/payments \
 }
 ```
 
-### 2. Query Payment Status
+### 2. Query Payment Status (Ownership Guarded)
 ```bash
-curl -i http://localhost:8080/api/v1/payments/5fa23d14-87cf-4a37-b4db-f5068aa5a9cf
+curl -i http://localhost:8080/api/v1/payments/5fa23d14-87cf-4a37-b4db-f5068aa5a9cf \
+  -H "Authorization: Bearer $TOKEN"
 ```
 **Response (HTTP 200 OK with `Cache-Control: no-store`):**
 ```json
@@ -158,28 +148,27 @@ curl -i http://localhost:8080/api/v1/payments/5fa23d14-87cf-4a37-b4db-f5068aa5a9
 }
 ```
 
-### 3. Send Signed Webhook (Manual HMAC-SHA256)
-Compute HMAC-SHA256 signature using OpenSSL and POST to webhook URL:
+### 3. Pull Internal Outbox Events
 ```bash
-SECRET="fake-webhook-secret-key-12345"
-PAYLOAD='{"eventId":"evt_man_101","eventType":"payment.success","gatewayOrderId":"fake_ord_sample","gatewayPaymentId":"fake_pay_sample"}'
+INTERNAL_TOKEN=$(./scripts/token.sh --sub erp-consumer --scopes payments:internal)
 
-# Calculate HMAC-SHA256 hex signature:
-SIGNATURE=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')
-
-# Post signed webhook:
-curl -i -X POST http://localhost:8080/api/v1/payments/webhook/fake \
-  -H "Content-Type: application/json" \
-  -H "X-Signature: $SIGNATURE" \
-  -d "$PAYLOAD"
+curl -i "http://localhost:8080/api/v1/internal/events?afterSequenceNo=0&limit=50" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
 ```
 
-### 4. Use Webhook Simulator (Automated)
-```bash
-curl -i -X POST "http://localhost:8080/dev/fake-gateway/PAY-A82F19X9KL22/simulate?result=success"
-```
-Options for `result`:
-- `success`: Sets FakeGateway order to SUCCESS, generates valid signature, transitions payment to `SUCCESS`.
-- `failed`: Sets FakeGateway order to FAILED, transitions payment to `FAILED`.
-- `amount_mismatch`: Mismatches amount by +10.00, flags payment with `requires_manual_review = true`.
-- `duplicate`: Re-sends same eventId to verify idempotent deduplication.
+---
+
+## 6. Environment Variables
+
+| Variable | Default (Local) | Description |
+|---|---|---|
+| `DATABASE_URL` | `jdbc:postgresql://localhost:5432/payment_db` | PostgreSQL JDBC connection URL |
+| `DATABASE_NAME` | `payment_db` | PostgreSQL database name |
+| `DATABASE_USERNAME` | `payment_user` | PostgreSQL database username |
+| `DATABASE_PASSWORD` | `payment_secret` | PostgreSQL database password |
+| `PORT` | `8080` | Application HTTP port |
+| `SPRING_PROFILES_ACTIVE` | `local` | Active Spring profile (`local`, `test`, `prod`) |
+| `PAYMENT_GATEWAY` | `fake` | Selected payment provider (`fake`) |
+| `DEV_JWT_SECRET` | `payment-secret-local-hmac-key-min-256-bits-ok!` | HS256 secret for local JWT signing |
+| `FAKE_GATEWAY_WEBHOOK_SECRET` | `fake-webhook-secret-key-12345` | Secret for HMAC-SHA256 webhook signatures |
+| `PAYMENT_EVENTS_CALLBACK_URL` | `http://localhost:8080/dev/fake-downstream/webhook` | HTTP webhook target for outbox callback delivery |
